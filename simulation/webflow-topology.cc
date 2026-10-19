@@ -1,0 +1,3055 @@
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/ppp-header.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/ipv4-static-routing-helper.h"
+#include "ns3/applications-module.h"
+#include "ns3/tcp-socket-factory.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cmath>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace ns3;
+
+using HttpHeaderMap = std::map<std::string, std::string>;
+constexpr double kPointToPointDelaySeconds = 0.005;
+constexpr const char* kPointToPointDataRate = "10Mbps";
+constexpr double kRouteCostTieTolerance = 1e-9;
+
+struct RouteMetrics
+{
+    double delaySeconds{0.0};
+    double packetLossRate{0.0};
+    double queueOccupancyRatio{0.0};
+    uint32_t routerHops{0};
+    bool delayAvailable{false};
+    bool packetLossAvailable{false};
+    bool queueOccupancyAvailable{false};
+    bool routerHopsAvailable{false};
+};
+
+struct NormalizedRouteMetrics
+{
+    double delay{0.5};
+    double packetLoss{0.5};
+    double queueOccupancy{0.5};
+    double routerHops{0.5};
+};
+
+struct RouteCostWeights
+{
+    double delay{0.4};
+    double packetLoss{0.3};
+    double queueOccupancy{0.2};
+    double routerHops{0.1};
+};
+
+struct RouteCostResult
+{
+    RouteMetrics raw;
+    NormalizedRouteMetrics normalized;
+    double cost{0.0};
+    bool valid{false};
+    bool measurementsComplete{false};
+};
+
+struct RouteMetricReferences
+{
+    double delaySeconds{0.050};
+    double packetLossRate{0.10};
+    double queueOccupancyRatio{1.0};
+    double routerHops{5.0};
+};
+
+static double
+NormalizeMetric(double value, bool available, double reference)
+{
+    constexpr double unavailableFallback = 0.5;
+    if (!available || !std::isfinite(value) || !std::isfinite(reference) || reference <= 0.0)
+    {
+        return unavailableFallback;
+    }
+    return std::clamp(value / reference, 0.0, 1.0);
+}
+
+static NormalizedRouteMetrics
+NormalizeRouteMetrics(const RouteMetrics& metrics, const RouteMetricReferences& references)
+{
+    return {NormalizeMetric(metrics.delaySeconds, metrics.delayAvailable, references.delaySeconds),
+            NormalizeMetric(metrics.packetLossRate,
+                            metrics.packetLossAvailable,
+                            references.packetLossRate),
+            NormalizeMetric(metrics.queueOccupancyRatio,
+                            metrics.queueOccupancyAvailable,
+                            references.queueOccupancyRatio),
+            NormalizeMetric(static_cast<double>(metrics.routerHops),
+                            metrics.routerHopsAvailable,
+                            references.routerHops)};
+}
+
+static RouteCostWeights
+NormalizeWeights(double delay, double packetLoss, double queueOccupancy, double routerHops)
+{
+    const double values[] = {delay, packetLoss, queueOccupancy, routerHops};
+    double maximum = 0.0;
+    for (double value : values)
+    {
+        if (!std::isfinite(value) || value < 0.0)
+        {
+            throw std::invalid_argument("Routing weights must be finite and nonnegative");
+        }
+        maximum = std::max(maximum, value);
+    }
+    if (maximum == 0.0)
+    {
+        throw std::invalid_argument("At least one routing weight must be greater than zero");
+    }
+
+    const double scaledSum = delay / maximum + packetLoss / maximum +
+                             queueOccupancy / maximum + routerHops / maximum;
+    return {(delay / maximum) / scaledSum,
+            (packetLoss / maximum) / scaledSum,
+            (queueOccupancy / maximum) / scaledSum,
+            (routerHops / maximum) / scaledSum};
+}
+
+static double
+CalculateRouteCost(const NormalizedRouteMetrics& metrics, const RouteCostWeights& weights)
+{
+    const double cost = metrics.delay * weights.delay +
+                        metrics.packetLoss * weights.packetLoss +
+                        metrics.queueOccupancy * weights.queueOccupancy +
+                        metrics.routerHops * weights.routerHops;
+    return std::clamp(cost, 0.0, 1.0);
+}
+
+static bool
+IsUnitInterval(double value)
+{
+    return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+}
+
+static void
+RunRouteMetricSelfTest(const RouteMetricReferences& references, const RouteCostWeights& weights)
+{
+    RouteMetrics belowRange;
+    belowRange.delayAvailable = true;
+    belowRange.packetLossAvailable = true;
+    belowRange.queueOccupancyAvailable = true;
+    belowRange.routerHopsAvailable = true;
+    RouteMetrics aboveRange = belowRange;
+    aboveRange.delaySeconds = references.delaySeconds * 2.0;
+    aboveRange.packetLossRate = references.packetLossRate * 2.0;
+    aboveRange.queueOccupancyRatio = references.queueOccupancyRatio * 2.0;
+    aboveRange.routerHops = static_cast<uint32_t>(references.routerHops * 2.0);
+
+    const NormalizedRouteMetrics low = NormalizeRouteMetrics(belowRange, references);
+    const NormalizedRouteMetrics high = NormalizeRouteMetrics(aboveRange, references);
+    RouteMetrics unavailable;
+    const NormalizedRouteMetrics neutral = NormalizeRouteMetrics(unavailable, references);
+    const double lowCost = CalculateRouteCost(low, weights);
+    const double highCost = CalculateRouteCost(high, weights);
+    const double weightSum = weights.delay + weights.packetLoss +
+                             weights.queueOccupancy + weights.routerHops;
+    const bool normalizedBounded =
+        IsUnitInterval(low.delay) && IsUnitInterval(low.packetLoss) &&
+        IsUnitInterval(low.queueOccupancy) && IsUnitInterval(low.routerHops) &&
+        IsUnitInterval(high.delay) && IsUnitInterval(high.packetLoss) &&
+        IsUnitInterval(high.queueOccupancy) && IsUnitInterval(high.routerHops) &&
+        IsUnitInterval(neutral.delay) && IsUnitInterval(neutral.packetLoss) &&
+        IsUnitInterval(neutral.queueOccupancy) && IsUnitInterval(neutral.routerHops);
+    const bool fallbackNeutral = neutral.delay == 0.5 && neutral.packetLoss == 0.5 &&
+                                 neutral.queueOccupancy == 0.5 && neutral.routerHops == 0.5;
+    if (!normalizedBounded || !fallbackNeutral || !IsUnitInterval(lowCost) ||
+        !IsUnitInterval(highCost) || std::abs(weightSum - 1.0) > 1e-12)
+    {
+        throw std::runtime_error("Route metric normalization self-test failed");
+    }
+    std::cout << "[Route metric test] PASS: normalized metrics and weighted costs are in [0,1]; "
+                 "unavailable metrics use the documented 0.5 fallback\n";
+}
+
+static RouteCostResult
+EvaluateRoute(const RouteMetrics& metrics,
+              const RouteMetricReferences& references,
+              const RouteCostWeights& weights)
+{
+    RouteCostResult result;
+    result.raw = metrics;
+    result.normalized = NormalizeRouteMetrics(metrics, references);
+    result.cost = CalculateRouteCost(result.normalized, weights);
+    result.measurementsComplete = metrics.delayAvailable && metrics.packetLossAvailable &&
+                                  metrics.queueOccupancyAvailable &&
+                                  metrics.routerHopsAvailable;
+    result.valid = result.measurementsComplete && IsUnitInterval(result.normalized.delay) &&
+                   IsUnitInterval(result.normalized.packetLoss) &&
+                   IsUnitInterval(result.normalized.queueOccupancy) &&
+                   IsUnitInterval(result.normalized.routerHops) && IsUnitInterval(result.cost);
+    return result;
+}
+
+static void
+PrintRouteCost(const std::string& name, const RouteCostResult& result)
+{
+    std::cout << name << " raw metrics: delay=" << result.raw.delaySeconds * 1000.0
+              << " ms (topology propagation estimate), packet_loss=";
+    if (result.raw.packetLossAvailable)
+    {
+        std::cout << result.raw.packetLossRate << " fraction";
+    }
+    else
+    {
+        std::cout << "unavailable (not measured)";
+    }
+    std::cout << ", queue_occupancy=";
+    if (result.raw.queueOccupancyAvailable)
+    {
+        std::cout << result.raw.queueOccupancyRatio << " ratio";
+    }
+    else
+    {
+        std::cout << "unavailable (not measured)";
+    }
+    std::cout << ", router_hops=";
+    if (result.raw.routerHopsAvailable)
+    {
+        std::cout << result.raw.routerHops;
+    }
+    else
+    {
+        std::cout << "unavailable";
+    }
+    std::cout << "\n"
+              << name << " normalized metrics: delay=" << result.normalized.delay
+              << ", loss=" << result.normalized.packetLoss
+              << ", queue=" << result.normalized.queueOccupancy
+              << ", hops=" << result.normalized.routerHops << "\n"
+              << name << " weighted cost: " << result.cost << "\n";
+}
+
+static std::string
+MakePayload(uint32_t size, uint32_t requestNumber, char firstCharacter)
+{
+    return std::string(size,
+                       static_cast<char>(firstCharacter + (requestNumber - 1) % 26));
+}
+
+static bool
+ParseHttpHeaders(const std::string& block, std::string& firstLine, HttpHeaderMap& headers)
+{
+    std::istringstream input(block);
+    if (!std::getline(input, firstLine))
+    {
+        return false;
+    }
+    if (!firstLine.empty() && firstLine.back() == '\r')
+    {
+        firstLine.pop_back();
+    }
+
+    std::string line;
+    while (std::getline(input, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        std::size_t colon = line.find(':');
+        if (colon == std::string::npos)
+        {
+            continue;
+        }
+
+        std::string name = line.substr(0, colon);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        std::string value = line.substr(colon + 1);
+        const std::size_t valueStart = value.find_first_not_of(" \t");
+        const std::size_t valueEnd = value.find_last_not_of(" \t");
+        if (valueStart == std::string::npos)
+        {
+            value.clear();
+        }
+        else
+        {
+            value = value.substr(valueStart, valueEnd - valueStart + 1);
+        }
+        if (!headers.emplace(name, value).second)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool
+ParseUnsignedHeader(const HttpHeaderMap& headers, const std::string& name, uint64_t& value)
+{
+    auto header = headers.find(name);
+    if (header == headers.end())
+    {
+        return false;
+    }
+    std::istringstream input(header->second);
+    std::string trailing;
+    return static_cast<bool>(input >> value) && !(input >> trailing);
+}
+
+static bool
+HasCommandLineOption(int argc, char* argv[], const std::string& option)
+{
+    const std::string assignmentPrefix = option + "=";
+    for (int index = 1; index < argc; ++index)
+    {
+        const std::string argument(argv[index]);
+        if (argument == option || argument.rfind(assignmentPrefix, 0) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string
+CsvEscape(const std::string& value)
+{
+    std::string escaped = "\"";
+    for (char character : value)
+    {
+        if (character == '"')
+        {
+            escaped += "\"\"";
+        }
+        else
+        {
+            escaped += character;
+        }
+    }
+    escaped += '"';
+    return escaped;
+}
+
+static std::string
+FormatSeconds(double seconds)
+{
+    std::ostringstream formatted;
+    formatted << std::setprecision(12) << seconds;
+    return formatted.str();
+}
+
+class HttpCsvLogger
+{
+  public:
+    explicit HttpCsvLogger(const std::filesystem::path& path)
+        : m_path(path),
+          m_output(path, std::ios::out | std::ios::trunc)
+    {
+        if (!m_output.is_open())
+        {
+            throw std::runtime_error("Unable to open HTTP request CSV: " + path.string());
+        }
+        m_output << "timestamp_seconds,traffic_load,route_mode,client_id,request_id,event,"
+                    "request_bytes,response_bytes,rtt_seconds,status\n";
+        if (!m_output)
+        {
+            throw std::runtime_error("Unable to write HTTP request CSV header: " +
+                                     path.string());
+        }
+    }
+
+    bool WriteRow(double timestampSeconds,
+                  bool hasTimestamp,
+                  const std::string& trafficLoad,
+                  const std::string& routeMode,
+                  uint32_t clientId,
+                  uint32_t requestId,
+                  const std::string& event,
+                  uint64_t requestBytes,
+                  uint64_t responseBytes,
+                  bool hasRtt,
+                  double rttSeconds,
+                  const std::string& status)
+    {
+        const std::string fields[] = {
+            hasTimestamp ? FormatSeconds(timestampSeconds) : "",
+            trafficLoad,
+            routeMode,
+            std::to_string(clientId),
+            std::to_string(requestId),
+            event,
+            std::to_string(requestBytes),
+            std::to_string(responseBytes),
+            hasRtt ? FormatSeconds(rttSeconds) : "",
+            status};
+        for (std::size_t index = 0; index < std::size(fields); ++index)
+        {
+            if (index != 0)
+            {
+                m_output << ',';
+            }
+            m_output << CsvEscape(fields[index]);
+        }
+        m_output << '\n';
+        if (!m_output)
+        {
+            m_error = "Write failed for HTTP request CSV: " + m_path.string();
+            return false;
+        }
+        return true;
+    }
+
+    bool Close()
+    {
+        m_output.flush();
+        if (!m_output)
+        {
+            m_error = "Flush failed for HTTP request CSV: " + m_path.string();
+            return false;
+        }
+        m_output.close();
+        if (m_output.fail())
+        {
+            m_error = "Close failed for HTTP request CSV: " + m_path.string();
+            return false;
+        }
+        return true;
+    }
+
+    const std::string& Error() const
+    {
+        return m_error;
+    }
+
+    const std::filesystem::path& Path() const
+    {
+        return m_path;
+    }
+
+  private:
+    std::filesystem::path m_path;
+    std::ofstream m_output;
+    std::string m_error;
+};
+
+static void
+LogHttpEvent(const std::string& trafficLoad,
+             const std::string& routeMode,
+             uint32_t clientId,
+             uint32_t requestId,
+             const std::string& event,
+             uint64_t payloadBytes,
+             const std::string& validation,
+             bool hasRtt = false,
+             double rttSeconds = 0.0)
+{
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(6)
+         << "[HTTP] timestamp_seconds=" << Simulator::Now().GetSeconds()
+         << " traffic_load=" << trafficLoad << " route_mode=" << routeMode
+         << " client_id=" << clientId << " request_id=" << requestId
+         << " event=" << event << " payload_bytes=" << payloadBytes
+         << " validation=" << validation << " rtt_seconds=";
+    if (hasRtt)
+    {
+        line << rttSeconds;
+    }
+    else
+    {
+        line << "n/a";
+    }
+    std::cout << line.str() << '\n';
+}
+
+class WebFlowHttpServer : public Application
+{
+  public:
+    static TypeId
+    GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::WebFlowHttpServer")
+                                .SetParent<Application>()
+                                .SetGroupName("Applications")
+                                .AddConstructor<WebFlowHttpServer>();
+        return tid;
+    }
+
+    void Configure(uint16_t port,
+                   uint32_t clientCount,
+                   uint32_t requestCount,
+                   uint32_t requestSize,
+                   uint32_t responseSize,
+                   std::string trafficLoad,
+                   std::string routeMode)
+    {
+        m_port = port;
+        m_clientCount = clientCount;
+        m_requestCount = requestCount;
+        m_requestSize = requestSize;
+        m_responseSize = responseSize;
+        m_trafficLoad = std::move(trafficLoad);
+        m_routeMode = std::move(routeMode);
+        m_totalRequests = static_cast<uint64_t>(clientCount) * requestCount;
+    }
+
+    bool IsListening() const
+    {
+        return m_listenSucceeded;
+    }
+
+    bool RequestParsed() const
+    {
+        return m_requestsParsed == m_totalRequests && m_invalidRequests == 0;
+    }
+
+    bool ResponseTransmitted() const
+    {
+        return m_responsesSent == m_totalRequests;
+    }
+
+    uint64_t RequestsParsed() const
+    {
+        return m_requestsParsed;
+    }
+
+    uint64_t UniqueRequestsReceived() const
+    {
+        return m_uniqueRequestIds.size();
+    }
+
+    uint64_t ResponsePayloadBytesSent() const
+    {
+        return m_responsePayloadBytesSent;
+    }
+
+  private:
+    struct QueuedResponse
+    {
+        std::string message;
+        uint32_t clientId{0};
+        uint32_t requestId{0};
+        uint32_t bodyBytes{0};
+        bool requestValid{false};
+    };
+
+    struct ConnectionState
+    {
+        Ptr<Socket> socket;
+        std::string requestBuffer;
+        std::deque<QueuedResponse> responseQueue;
+        std::string activeResponse;
+        std::size_t responseOffset{0};
+        uint32_t clientId{0};
+        uint32_t activeRequestId{0};
+        uint32_t activeResponseBodyBytes{0};
+        bool activeRequestValid{false};
+        uint32_t requestsParsed{0};
+        uint32_t responsesQueued{0};
+        uint32_t responsesSent{0};
+        bool sendShutdown{false};
+    };
+
+    ConnectionState* FindConnection(Ptr<Socket> socket)
+    {
+        for (auto& connection : m_connections)
+        {
+            if (connection.socket == socket)
+            {
+                return &connection;
+            }
+        }
+        return nullptr;
+    }
+
+    void StartApplication() override
+    {
+        m_listeningSocket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+        InetSocketAddress local(Ipv4Address::GetAny(), m_port);
+        if (m_listeningSocket->Bind(local) < 0 || m_listeningSocket->Listen() < 0)
+        {
+            std::cerr << "[TCP server] failed to bind/listen on port " << m_port << "\n";
+            return;
+        }
+
+        m_listeningSocket->SetAcceptCallback(
+            MakeNullCallback<bool, Ptr<Socket>, const Address&>(),
+            MakeCallback(&WebFlowHttpServer::HandleAccept, this));
+        m_listenSucceeded = true;
+        std::cout << "[TCP server] listening on port " << m_port << " at "
+                  << Simulator::Now().As(Time::S) << "\n";
+    }
+
+    void StopApplication() override
+    {
+        for (auto& connection : m_connections)
+        {
+            if (connection.socket)
+            {
+                connection.socket->Close();
+            }
+        }
+        m_connections.clear();
+        if (m_listeningSocket)
+        {
+            m_listeningSocket->Close();
+            m_listeningSocket = nullptr;
+        }
+    }
+
+    void HandleAccept(Ptr<Socket> socket, const Address& from)
+    {
+        ConnectionState connection;
+        connection.socket = socket;
+        m_connections.push_back(std::move(connection));
+        socket->SetRecvCallback(MakeCallback(&WebFlowHttpServer::HandleRead, this));
+        socket->SetSendCallback(MakeCallback(&WebFlowHttpServer::HandleSend, this));
+        std::cout << "[TCP server] connection accepted from "
+                  << InetSocketAddress::ConvertFrom(from).GetIpv4() << ":"
+                  << InetSocketAddress::ConvertFrom(from).GetPort() << " at "
+                  << Simulator::Now().As(Time::S) << "\n";
+    }
+
+    void HandleRead(Ptr<Socket> socket)
+    {
+        ConnectionState* connection = FindConnection(socket);
+        if (!connection)
+        {
+            std::cerr << "[TCP server] received data on an unknown connection\n";
+            return;
+        }
+
+        while (true)
+        {
+            Ptr<Packet> packet = socket->Recv();
+            if (!packet || packet->GetSize() == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> bytes(packet->GetSize());
+            packet->CopyData(bytes.data(), packet->GetSize());
+            connection->requestBuffer.append(reinterpret_cast<const char*>(bytes.data()),
+                                             bytes.size());
+        }
+
+        while (true)
+        {
+            const std::size_t headerEnd = connection->requestBuffer.find("\r\n\r\n");
+            if (headerEnd == std::string::npos)
+            {
+                return;
+            }
+
+            std::string requestLine;
+            HttpHeaderMap headers;
+            if (!ParseHttpHeaders(connection->requestBuffer.substr(0, headerEnd),
+                                  requestLine,
+                                  headers))
+            {
+                ++m_invalidRequests;
+                LogHttpEvent(m_trafficLoad,
+                             m_routeMode,
+                             connection->clientId,
+                             0,
+                             "server_request_malformed",
+                             0,
+                             "FAIL");
+                std::cerr << "[TCP server] malformed request headers\n";
+                socket->Close();
+                return;
+            }
+
+            uint64_t contentLength = 0;
+            uint64_t requestNumber = 0;
+            uint64_t clientId = 0;
+            if (!ParseUnsignedHeader(headers, "content-length", contentLength) ||
+                !ParseUnsignedHeader(headers, "x-request-id", requestNumber) ||
+                !ParseUnsignedHeader(headers, "x-client-id", clientId) ||
+                contentLength > m_requestSize || clientId > m_clientCount)
+            {
+                ++m_invalidRequests;
+                LogHttpEvent(m_trafficLoad,
+                             m_routeMode,
+                             static_cast<uint32_t>(clientId),
+                             requestNumber <= std::numeric_limits<uint32_t>::max()
+                                 ? static_cast<uint32_t>(requestNumber)
+                                 : 0,
+                             "server_request_malformed",
+                             contentLength,
+                             "FAIL");
+                std::cerr << "[TCP server] invalid request length or request ID\n";
+                socket->Close();
+                return;
+            }
+
+            const std::size_t messageSize = headerEnd + 4 + static_cast<std::size_t>(contentLength);
+            if (connection->requestBuffer.size() < messageSize)
+            {
+                return;
+            }
+
+            const std::string body = connection->requestBuffer.substr(headerEnd + 4,
+                                                                       contentLength);
+            connection->requestBuffer.erase(0, messageSize);
+            const uint32_t expectedNumber = connection->requestsParsed + 1;
+            const bool validIdentifier = clientId > 0 && clientId <= m_clientCount &&
+                                         requestNumber > 0 && requestNumber <= m_requestCount;
+            const bool uniqueIdentifier =
+                validIdentifier &&
+                m_uniqueRequestIds.emplace(static_cast<uint32_t>(clientId),
+                                           static_cast<uint32_t>(requestNumber)).second;
+            const bool validRequest =
+                requestLine == "POST / HTTP/1.1" && headers.count("host") &&
+                clientId > 0 && (connection->clientId == 0 || connection->clientId == clientId) &&
+                contentLength == m_requestSize && requestNumber == expectedNumber &&
+                body == MakePayload(m_requestSize, expectedNumber, 'a') && uniqueIdentifier;
+            if (connection->clientId == 0 && validRequest)
+            {
+                connection->clientId = static_cast<uint32_t>(clientId);
+            }
+            ++connection->requestsParsed;
+            ++m_requestsParsed;
+            if (!validRequest)
+            {
+                ++m_invalidRequests;
+            }
+            LogHttpEvent(m_trafficLoad,
+                         m_routeMode,
+                         static_cast<uint32_t>(clientId),
+                         static_cast<uint32_t>(requestNumber),
+                         "server_request_received",
+                         body.size(),
+                         validRequest ? "PASS" : "FAIL");
+            QueueResponse(*connection, socket, clientId, requestNumber, validRequest);
+        }
+    }
+
+    void QueueResponse(ConnectionState& connection,
+                       Ptr<Socket> socket,
+                       uint64_t clientId,
+                       uint64_t requestNumber,
+                       bool validRequest)
+    {
+        const std::string body = MakePayload(m_responseSize,
+                                             static_cast<uint32_t>(requestNumber),
+                                             'A');
+        const std::string status = validRequest ? "HTTP/1.1 200 OK" : "HTTP/1.1 400 Bad Request";
+        const std::string connectionHeader = requestNumber == m_requestCount ? "close" : "keep-alive";
+        QueuedResponse response;
+        response.message = status + "\r\nContent-Length: " + std::to_string(body.size()) +
+                           "\r\nX-Client-Id: " + std::to_string(clientId) +
+                           "\r\nX-Request-Id: " + std::to_string(requestNumber) +
+                           "\r\nConnection: " + connectionHeader + "\r\n\r\n" + body;
+        response.clientId = static_cast<uint32_t>(clientId);
+        response.requestId = static_cast<uint32_t>(requestNumber);
+        response.bodyBytes = static_cast<uint32_t>(body.size());
+        response.requestValid = validRequest;
+        connection.responseQueue.push_back(std::move(response));
+        ++connection.responsesQueued;
+        FlushResponses(connection, socket);
+    }
+
+    void HandleSend(Ptr<Socket> socket, uint32_t)
+    {
+        ConnectionState* connection = FindConnection(socket);
+        if (!connection)
+        {
+            return;
+        }
+        FlushResponses(*connection, socket);
+    }
+
+    void FlushResponses(ConnectionState& connection, Ptr<Socket> socket)
+    {
+        if (connection.sendShutdown)
+        {
+            return;
+        }
+
+        while (true)
+        {
+            if (connection.activeResponse.empty())
+            {
+                if (connection.responseQueue.empty())
+                {
+                    if (connection.responsesSent == m_requestCount)
+                    {
+                        connection.sendShutdown = true;
+                        socket->ShutdownSend();
+                    }
+                    return;
+                }
+                const QueuedResponse& response = connection.responseQueue.front();
+                connection.activeResponse = response.message;
+                connection.activeRequestId = response.requestId;
+                connection.activeResponseBodyBytes = response.bodyBytes;
+                connection.activeRequestValid = response.requestValid;
+                connection.responseQueue.pop_front();
+                connection.responseOffset = 0;
+            }
+
+            const std::size_t remaining =
+                connection.activeResponse.size() - connection.responseOffset;
+            Ptr<Packet> packet = Create<Packet>(
+                reinterpret_cast<const uint8_t*>(connection.activeResponse.data() +
+                                                 connection.responseOffset),
+                static_cast<uint32_t>(remaining));
+            const int sent = socket->Send(packet);
+            if (sent < 0)
+            {
+                return;
+            }
+            if (sent == 0)
+            {
+                return;
+            }
+            connection.responseOffset += static_cast<std::size_t>(sent);
+
+            if (connection.responseOffset == connection.activeResponse.size())
+            {
+                ++connection.responsesSent;
+                ++m_responsesSent;
+                m_responsePayloadBytesSent += connection.activeResponseBodyBytes;
+                LogHttpEvent(m_trafficLoad,
+                             m_routeMode,
+                             connection.clientId,
+                             connection.activeRequestId,
+                             "server_response_sent",
+                             connection.activeResponseBodyBytes,
+                             connection.activeRequestValid ? "PASS" : "FAIL");
+                connection.activeResponse.clear();
+                connection.responseOffset = 0;
+                connection.activeResponseBodyBytes = 0;
+            }
+        }
+    }
+
+    uint16_t m_port{8080};
+    uint32_t m_clientCount{0};
+    uint32_t m_requestCount{0};
+    uint32_t m_requestSize{0};
+    uint32_t m_responseSize{0};
+    std::string m_trafficLoad;
+    std::string m_routeMode;
+    Ptr<Socket> m_listeningSocket;
+    std::vector<ConnectionState> m_connections;
+    std::set<std::pair<uint32_t, uint32_t>> m_uniqueRequestIds;
+    uint64_t m_totalRequests{0};
+    uint64_t m_requestsParsed{0};
+    uint64_t m_invalidRequests{0};
+    uint64_t m_responsesSent{0};
+    uint64_t m_responsePayloadBytesSent{0};
+    bool m_listenSucceeded{false};
+};
+
+NS_OBJECT_ENSURE_REGISTERED(WebFlowHttpServer);
+
+class WebFlowHttpClient : public Application
+{
+    private:
+        struct RequestRecord
+        {
+                uint32_t requestId{0};
+                double sentAtSeconds{0.0};
+                double rttSeconds{0.0};
+                uint32_t requestBytes{0};
+                uint32_t responseBytes{0};
+                bool requestSent{false};
+                bool responseSeen{false};
+                bool hasRtt{false};
+                bool validated{false};
+                std::string status{"not_sent"};
+        };
+
+  public:
+    static TypeId
+    GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::WebFlowHttpClient")
+                                .SetParent<Application>()
+                                .SetGroupName("Applications")
+                                .AddConstructor<WebFlowHttpClient>();
+        return tid;
+    }
+
+    void Configure(Ipv4Address serverAddress,
+                   uint16_t port,
+                   uint32_t clientId,
+                   uint32_t requestSize,
+                   Time requestInterval,
+                   uint32_t requestCount,
+                   uint32_t responseSize,
+                   const std::string& trafficLoad,
+                   const std::string& routeMode,
+                   std::shared_ptr<HttpCsvLogger> csvLogger)
+    {
+        m_serverAddress = serverAddress;
+        m_port = port;
+        m_clientId = clientId;
+        m_requestSize = requestSize;
+        m_requestInterval = requestInterval;
+        m_requestCount = requestCount;
+        m_responseSize = responseSize;
+        m_trafficLoad = trafficLoad;
+        m_routeMode = routeMode;
+        m_csvLogger = std::move(csvLogger);
+        m_requestRecords.resize(requestCount);
+        for (uint32_t index = 0; index < requestCount; ++index)
+        {
+            m_requestRecords[index].requestId = index + 1;
+        }
+    }
+
+    bool ResponseValidated() const
+    {
+        return m_successfulResponses == m_requestCount && !m_responseParseFailed &&
+               m_duplicateResponses == 0 && m_malformedResponses == 0;
+    }
+
+    bool ConnectionWasEstablished() const
+    {
+        return m_connectionSucceeded;
+    }
+
+    bool ConnectionAttemptFailed() const
+    {
+        return m_connectionFailed;
+    }
+
+    uint32_t RequestsSent() const
+    {
+        return m_requestsSent;
+    }
+
+    uint32_t SuccessfulResponses() const
+    {
+        return m_successfulResponses;
+    }
+
+    uint32_t FailedResponses() const
+    {
+        return m_requestCount - m_successfulResponses;
+    }
+
+    double AverageRttSeconds() const
+    {
+        double total = 0.0;
+        uint32_t samples = 0;
+        for (const auto& record : m_requestRecords)
+        {
+            if (record.validated && record.hasRtt)
+            {
+                total += record.rttSeconds;
+                ++samples;
+            }
+        }
+        return samples ? total / samples : 0.0;
+    }
+
+    double MaximumRttSeconds() const
+    {
+        double maximum = 0.0;
+        for (const auto& record : m_requestRecords)
+        {
+            if (record.validated && record.hasRtt)
+            {
+                maximum = std::max(maximum, record.rttSeconds);
+            }
+        }
+        return maximum;
+    }
+
+    uint64_t CompletedRttSamples() const
+    {
+        return std::count_if(m_requestRecords.begin(), m_requestRecords.end(), [](const auto& record) {
+            return record.hasRtt;
+        });
+    }
+
+    double CompletedRttSumSeconds() const
+    {
+        double total = 0.0;
+        for (const auto& record : m_requestRecords)
+        {
+            if (record.hasRtt)
+            {
+                total += record.rttSeconds;
+            }
+        }
+        return total;
+    }
+
+    uint64_t RequestPayloadBytesSent() const
+    {
+        return m_requestPayloadBytesSent;
+    }
+
+    uint64_t ResponsePayloadBytesReceived() const
+    {
+        return m_responsePayloadBytesReceived;
+    }
+
+    uint64_t ValidatedResponsePayloadBytesReceived() const
+    {
+        return m_validatedResponsePayloadBytesReceived;
+    }
+
+    uint32_t DuplicateResponses() const
+    {
+        return m_duplicateResponses;
+    }
+
+    uint32_t MalformedResponses() const
+    {
+        return m_malformedResponses;
+    }
+
+    bool HasFirstRequestSent() const
+    {
+        return m_hasFirstRequestSent;
+    }
+
+    double FirstRequestSentSeconds() const
+    {
+        return m_firstRequestSentSeconds;
+    }
+
+    bool HasLastResponseValidated() const
+    {
+        return m_hasLastResponseValidated;
+    }
+
+    double LastResponseValidatedSeconds() const
+    {
+        return m_lastResponseValidatedSeconds;
+    }
+
+    bool FinalizeCsvRows()
+    {
+        bool succeeded = true;
+        for (auto& record : m_requestRecords)
+        {
+            if (record.status == "awaiting_response")
+            {
+                record.status = "missing_response";
+            }
+            const std::string event = record.status == "validated" || record.status == "invalid" ||
+                                              record.status == "duplicate_response"
+                                          ? "request_response"
+                                          : (record.requestSent ? "request_missing_response"
+                                                                : "request_not_sent");
+            succeeded = m_csvLogger->WriteRow(record.sentAtSeconds,
+                                              record.requestSent,
+                                              m_trafficLoad,
+                                              m_routeMode,
+                                              m_clientId,
+                                              record.requestId,
+                                              event,
+                                              record.requestBytes,
+                                              record.responseBytes,
+                                              record.hasRtt,
+                                              record.rttSeconds,
+                                              record.status) &&
+                        succeeded;
+        }
+        return succeeded;
+    }
+
+  private:
+    void StartApplication() override
+    {
+        m_running = true;
+        m_socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+        m_socket->SetConnectCallback(MakeCallback(&WebFlowHttpClient::ConnectionSucceeded, this),
+                                     MakeCallback(&WebFlowHttpClient::ConnectionFailed, this));
+        m_socket->SetRecvCallback(MakeCallback(&WebFlowHttpClient::HandleRead, this));
+        m_socket->SetSendCallback(MakeCallback(&WebFlowHttpClient::HandleSend, this));
+        if (m_socket->Connect(InetSocketAddress(m_serverAddress, m_port)) < 0)
+        {
+            std::cerr << "[TCP client] connect call failed for " << m_serverAddress << ":"
+                      << m_port << "\n";
+        }
+    }
+
+    void StopApplication() override
+    {
+        m_running = false;
+        if (m_socket)
+        {
+            m_socket->Close();
+            m_socket = nullptr;
+        }
+    }
+
+    void ConnectionSucceeded(Ptr<Socket> socket)
+    {
+        m_connectionSucceeded = true;
+        std::cout << "[TCP client #" << m_clientId << "] connected to "
+                  << m_serverAddress << ":" << m_port
+                  << " at " << Simulator::Now().As(Time::S) << "\n";
+        std::ostringstream host;
+        host << m_serverAddress;
+        m_hostHeader = host.str() + ":" + std::to_string(m_port);
+        SendNextRequest(socket);
+    }
+
+    void ConnectionFailed(Ptr<Socket>)
+    {
+        m_connectionFailed = true;
+        std::cerr << "[TCP client #" << m_clientId << "] connection to "
+                  << m_serverAddress << ":" << m_port
+                  << " failed\n";
+    }
+
+    void HandleSend(Ptr<Socket> socket, uint32_t)
+    {
+        FlushRequest(socket);
+    }
+
+    void SendNextRequest(Ptr<Socket> socket)
+    {
+        if (!m_running || m_nextRequestNumber >= m_requestCount)
+        {
+            return;
+        }
+        m_activeRequestNumber = ++m_nextRequestNumber;
+        const std::string body = MakePayload(m_requestSize, m_activeRequestNumber, 'a');
+        m_activeRequest = "POST / HTTP/1.1\r\nHost: " + m_hostHeader +
+                          "\r\nContent-Length: " + std::to_string(body.size()) +
+                          "\r\nX-Client-Id: " + std::to_string(m_clientId) +
+                          "\r\nX-Request-Id: " + std::to_string(m_activeRequestNumber) +
+                          "\r\nConnection: keep-alive\r\n\r\n" + body;
+        m_requestOffset = 0;
+        m_activeRequestSent = false;
+        FlushRequest(socket);
+    }
+
+    void FlushRequest(Ptr<Socket> socket)
+    {
+        if (m_activeRequestSent)
+        {
+            return;
+        }
+        while (m_requestOffset < m_activeRequest.size())
+        {
+            const std::size_t remaining = m_activeRequest.size() - m_requestOffset;
+            Ptr<Packet> packet = Create<Packet>(
+                reinterpret_cast<const uint8_t*>(m_activeRequest.data() + m_requestOffset),
+                static_cast<uint32_t>(remaining));
+            const int sent = socket->Send(packet);
+            if (sent < 0 || sent == 0)
+            {
+                return;
+            }
+            m_requestOffset += static_cast<std::size_t>(sent);
+        }
+
+        m_activeRequestSent = true;
+        RequestRecord& record = m_requestRecords[m_activeRequestNumber - 1];
+        record.requestSent = true;
+        record.sentAtSeconds = Simulator::Now().GetSeconds();
+        record.requestBytes = m_requestSize;
+        record.status = "awaiting_response";
+        if (!m_hasFirstRequestSent)
+        {
+            m_hasFirstRequestSent = true;
+            m_firstRequestSentSeconds = record.sentAtSeconds;
+        }
+        m_requestPayloadBytesSent += m_requestSize;
+        ++m_requestsSent;
+        LogHttpEvent(m_trafficLoad,
+                     m_routeMode,
+                     m_clientId,
+                     m_activeRequestNumber,
+                     "client_request_sent",
+                     m_requestSize,
+                     "PENDING");
+        if (m_requestsSent < m_requestCount)
+        {
+            Simulator::Schedule(m_requestInterval,
+                                &WebFlowHttpClient::SendNextRequest,
+                                this,
+                                socket);
+        }
+    }
+
+    void HandleRead(Ptr<Socket> socket)
+    {
+        while (true)
+        {
+            Ptr<Packet> packet = socket->Recv();
+            if (!packet || packet->GetSize() == 0)
+            {
+                break;
+            }
+
+            std::vector<uint8_t> bytes(packet->GetSize());
+            packet->CopyData(bytes.data(), packet->GetSize());
+            m_responseBuffer.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        ProcessResponses(socket);
+    }
+
+    void ProcessResponses(Ptr<Socket> socket)
+    {
+        while (true)
+        {
+            const std::size_t headerEnd = m_responseBuffer.find("\r\n\r\n");
+            if (headerEnd == std::string::npos)
+            {
+                return;
+            }
+
+            std::string statusLine;
+            HttpHeaderMap headers;
+            if (!ParseHttpHeaders(m_responseBuffer.substr(0, headerEnd), statusLine, headers))
+            {
+                m_responseParseFailed = true;
+                ++m_malformedResponses;
+                LogHttpEvent(m_trafficLoad,
+                             m_routeMode,
+                             m_clientId,
+                             0,
+                             "client_response_malformed",
+                             0,
+                             "FAIL");
+                std::cerr << "[TCP client #" << m_clientId << "] invalid response headers\n";
+                socket->Close();
+                return;
+            }
+
+            uint64_t contentLength = 0;
+            uint64_t responseClientId = 0;
+            uint64_t responseNumber = 0;
+            if (!ParseUnsignedHeader(headers, "content-length", contentLength) ||
+                !ParseUnsignedHeader(headers, "x-client-id", responseClientId) ||
+                !ParseUnsignedHeader(headers, "x-request-id", responseNumber))
+            {
+                m_responseParseFailed = true;
+                ++m_malformedResponses;
+                LogHttpEvent(m_trafficLoad,
+                             m_routeMode,
+                             m_clientId,
+                             0,
+                             "client_response_malformed",
+                             0,
+                             "FAIL");
+                std::cerr << "[TCP client #" << m_clientId
+                          << "] response has invalid Content-Length or request ID\n";
+                socket->Close();
+                return;
+            }
+
+            if (responseNumber == 0 || responseNumber > m_requestCount ||
+                responseClientId != m_clientId || contentLength > m_responseSize)
+            {
+                m_responseParseFailed = true;
+                ++m_malformedResponses;
+                LogHttpEvent(m_trafficLoad,
+                             m_routeMode,
+                             m_clientId,
+                             static_cast<uint32_t>(responseNumber),
+                             "client_response_malformed",
+                             contentLength,
+                             "FAIL");
+                std::cerr << "[TCP client #" << m_clientId
+                          << "] response client/request ID or body length is invalid\n";
+                socket->Close();
+                return;
+            }
+
+            const std::size_t bodyOffset = headerEnd + 4;
+            if (m_responseBuffer.size() < bodyOffset + contentLength)
+            {
+                return;
+            }
+
+            const std::string body = m_responseBuffer.substr(bodyOffset, contentLength);
+            RequestRecord& record = m_requestRecords[responseNumber - 1];
+            const Time receivedAt = Simulator::Now();
+            if (record.responseSeen)
+            {
+                ++m_duplicateResponses;
+                m_responseParseFailed = true;
+                if (record.validated)
+                {
+                    --m_successfulResponses;
+                    m_validatedResponsePayloadBytesReceived -= record.responseBytes;
+                    record.validated = false;
+                }
+                record.status = "duplicate_response";
+                record.responseBytes += static_cast<uint32_t>(contentLength);
+                m_responsePayloadBytesReceived += contentLength;
+                LogHttpEvent(m_trafficLoad,
+                             m_routeMode,
+                             m_clientId,
+                             static_cast<uint32_t>(responseNumber),
+                             "client_duplicate_response",
+                             contentLength,
+                             "FAIL",
+                             record.hasRtt,
+                             record.rttSeconds);
+                m_responseBuffer.erase(0, bodyOffset + contentLength);
+                continue;
+            }
+
+            record.responseSeen = true;
+            record.responseBytes = static_cast<uint32_t>(contentLength);
+            m_responsePayloadBytesReceived += contentLength;
+            if (record.requestSent)
+            {
+                record.rttSeconds = receivedAt.GetSeconds() - record.sentAtSeconds;
+                record.hasRtt = true;
+            }
+            const bool valid = record.requestSent && contentLength == m_responseSize &&
+                               statusLine == "HTTP/1.1 200 OK" &&
+                               body == MakePayload(m_responseSize,
+                                                   static_cast<uint32_t>(responseNumber),
+                                                   'A');
+            if (valid)
+            {
+                record.validated = true;
+                record.status = "validated";
+                ++m_successfulResponses;
+                m_validatedResponsePayloadBytesReceived += contentLength;
+                if (!m_hasLastResponseValidated ||
+                    receivedAt.GetSeconds() > m_lastResponseValidatedSeconds)
+                {
+                    m_hasLastResponseValidated = true;
+                    m_lastResponseValidatedSeconds = receivedAt.GetSeconds();
+                }
+            }
+            else
+            {
+                record.status = "invalid";
+                m_responseParseFailed = true;
+            }
+
+            LogHttpEvent(m_trafficLoad,
+                         m_routeMode,
+                         m_clientId,
+                         static_cast<uint32_t>(responseNumber),
+                         "client_response_received",
+                         contentLength,
+                         valid ? "PASS" : "FAIL",
+                         record.hasRtt,
+                         record.rttSeconds);
+            m_responseBuffer.erase(0, bodyOffset + contentLength);
+        }
+    }
+
+    Ipv4Address m_serverAddress;
+    uint16_t m_port{8080};
+    uint32_t m_clientId{0};
+    uint32_t m_requestSize{0};
+    Time m_requestInterval{Seconds(1)};
+    uint32_t m_requestCount{0};
+    uint32_t m_responseSize{0};
+    std::string m_trafficLoad;
+    std::string m_routeMode;
+    std::shared_ptr<HttpCsvLogger> m_csvLogger;
+    Ptr<Socket> m_socket;
+    std::string m_hostHeader;
+    std::string m_activeRequest;
+    std::size_t m_requestOffset{0};
+    std::string m_responseBuffer;
+    std::vector<RequestRecord> m_requestRecords;
+    uint32_t m_nextRequestNumber{0};
+    uint32_t m_activeRequestNumber{0};
+    uint32_t m_requestsSent{0};
+    uint32_t m_successfulResponses{0};
+    uint32_t m_duplicateResponses{0};
+    uint32_t m_malformedResponses{0};
+    uint64_t m_requestPayloadBytesSent{0};
+    uint64_t m_responsePayloadBytesReceived{0};
+    uint64_t m_validatedResponsePayloadBytesReceived{0};
+    double m_firstRequestSentSeconds{0.0};
+    double m_lastResponseValidatedSeconds{0.0};
+    bool m_activeRequestSent{false};
+    bool m_responseParseFailed{false};
+    bool m_running{false};
+    bool m_connectionSucceeded{false};
+    bool m_connectionFailed{false};
+    bool m_hasFirstRequestSent{false};
+    bool m_hasLastResponseValidated{false};
+};
+
+NS_OBJECT_ENSURE_REGISTERED(WebFlowHttpClient);
+
+struct RouteQueueSample
+{
+    uint64_t occupancy{0};
+    uint64_t capacity{0};
+    QueueSizeUnit unit{PACKETS};
+    bool available{false};
+
+    double Ratio() const
+    {
+        return available && capacity > 0
+                   ? static_cast<double>(occupancy) / static_cast<double>(capacity)
+                   : 0.5;
+    }
+};
+
+static RouteQueueSample
+SampleRouteQueues(const std::vector<Ptr<NetDevice>>& devices)
+{
+    RouteQueueSample sample;
+    bool firstQueue = true;
+    if (devices.empty())
+    {
+        return sample;
+    }
+    for (const auto& netDevice : devices)
+    {
+        Ptr<PointToPointNetDevice> device = DynamicCast<PointToPointNetDevice>(netDevice);
+        if (!device)
+        {
+            return {};
+        }
+        Ptr<Queue<Packet>> queue = device->GetQueue();
+        if (!queue)
+        {
+            return {};
+        }
+        const QueueSize current = queue->GetCurrentSize();
+        const QueueSize maximum = queue->GetMaxSize();
+        if (maximum.GetValue() == 0 || current.GetUnit() != maximum.GetUnit())
+        {
+            return {};
+        }
+        if (firstQueue)
+        {
+            sample.unit = maximum.GetUnit();
+            firstQueue = false;
+        }
+        else if (sample.unit != maximum.GetUnit())
+        {
+            return {};
+        }
+        sample.occupancy += current.GetValue();
+        sample.capacity += maximum.GetValue();
+    }
+    sample.available = sample.capacity > 0;
+    return sample;
+}
+
+static const char*
+QueueUnitName(QueueSizeUnit unit)
+{
+    return unit == PACKETS ? "packets" : "bytes";
+}
+
+class RouteMetricsCsvLogger
+{
+  public:
+    explicit RouteMetricsCsvLogger(const std::filesystem::path& path)
+        : m_path(path),
+          m_output(path, std::ios::out | std::ios::trunc)
+    {
+        if (!m_output.is_open())
+        {
+            throw std::runtime_error("Unable to open route metrics CSV: " + path.string());
+        }
+        m_output << "timestamp_seconds,route_label,delay_rtt_ms,rtt_samples_cumulative,"
+                "requests_sent_cumulative,"
+                    "requests_received_cumulative,packet_loss_rate,queue_occupancy,"
+                    "queue_capacity,queue_unit,queue_occupancy_ratio,router_hops,"
+                    "delay_valid,loss_valid,queue_valid,hop_valid,measurement_validity,"
+                    "weighted_cost,selected_route,selection_reason\n";
+        if (!m_output)
+        {
+            throw std::runtime_error("Unable to write route metrics CSV header: " +
+                                     path.string());
+        }
+    }
+
+    bool Write(double timestampSeconds,
+               const std::string& routeLabel,
+               const RouteMetrics& metrics,
+               double weightedCost,
+               uint64_t rttSamples,
+               uint64_t requestsSent,
+               uint64_t requestsReceived,
+               bool trafficAttributable,
+               const RouteQueueSample& queue,
+               const std::string& validity,
+               const std::string& selectedRoute,
+               const std::string& selectionReason)
+    {
+        const std::string fields[] = {
+            FormatSeconds(timestampSeconds),
+            routeLabel,
+            metrics.delayAvailable ? FormatSeconds(metrics.delaySeconds * 1000.0) : "",
+            trafficAttributable ? std::to_string(rttSamples) : "",
+            trafficAttributable ? std::to_string(requestsSent) : "",
+            trafficAttributable ? std::to_string(requestsReceived) : "",
+            metrics.packetLossAvailable ? FormatSeconds(metrics.packetLossRate) : "",
+            queue.available ? std::to_string(queue.occupancy) : "",
+            queue.available ? std::to_string(queue.capacity) : "",
+            queue.available ? QueueUnitName(queue.unit) : "",
+            queue.available ? FormatSeconds(metrics.queueOccupancyRatio) : "",
+            metrics.routerHopsAvailable ? std::to_string(metrics.routerHops) : "",
+            metrics.delayAvailable ? "true" : "false",
+            metrics.packetLossAvailable ? "true" : "false",
+            metrics.queueOccupancyAvailable ? "true" : "false",
+            metrics.routerHopsAvailable ? "true" : "false",
+            validity,
+            FormatSeconds(weightedCost),
+            selectedRoute,
+            selectionReason};
+        for (std::size_t index = 0; index < std::size(fields); ++index)
+        {
+            if (index != 0)
+            {
+                m_output << ',';
+            }
+            m_output << CsvEscape(fields[index]);
+        }
+        m_output << '\n';
+        if (!m_output)
+        {
+            m_error = "Write failed for route metrics CSV: " + m_path.string();
+            return false;
+        }
+        return true;
+    }
+
+    bool Close()
+    {
+        m_output.flush();
+        if (!m_output)
+        {
+            m_error = "Flush failed for route metrics CSV: " + m_path.string();
+            return false;
+        }
+        m_output.close();
+        if (m_output.fail())
+        {
+            m_error = "Close failed for route metrics CSV: " + m_path.string();
+            return false;
+        }
+        return true;
+    }
+
+    const std::string& Error() const
+    {
+        return m_error;
+    }
+
+    const std::filesystem::path& Path() const
+    {
+        return m_path;
+    }
+
+  private:
+    std::filesystem::path m_path;
+    std::ofstream m_output;
+    std::string m_error;
+};
+
+struct RouteMonitorContext
+{
+    std::string trafficLoad;
+    std::string routeMode;
+    std::string trafficRoute;
+    std::string actualForwardingRoute;
+    double intervalSeconds{1.0};
+    double stopSeconds{0.0};
+    const std::vector<Ptr<WebFlowHttpClient>>* clients{nullptr};
+    Ptr<WebFlowHttpServer> server;
+    std::vector<Ptr<NetDevice>> routeAQueueDevices;
+    std::vector<Ptr<NetDevice>> routeBQueueDevices;
+    RouteMetricReferences references;
+    RouteCostWeights weights;
+    std::shared_ptr<RouteMetricsCsvLogger> csvLogger;
+    bool writeFailed{false};
+};
+
+class SimulationEventLogger
+{
+  public:
+    explicit SimulationEventLogger(const std::filesystem::path& path)
+        : m_output(path, std::ios::out | std::ios::trunc)
+    {
+        if (!m_output.is_open())
+        {
+            throw std::runtime_error("Unable to open simulation event log: " + path.string());
+        }
+    }
+
+    void WritePacket(double timestampSeconds,
+                     const std::string& source,
+                     const std::string& destination,
+                     const std::string& currentNode,
+                     const std::string& nextHop,
+                     const std::string& route,
+                     uint64_t packetId)
+    {
+        if (m_eventCount >= kMaximumEvents)
+        {
+            if (!m_limitReported)
+            {
+                std::cerr << "[EVENTS] Packet event limit reached; additional transmit "
+                             "events are not recorded.\n";
+                m_limitReported = true;
+            }
+            return;
+        }
+        m_output << std::fixed << std::setprecision(9)
+                 << "{\"timestamp_seconds\":" << timestampSeconds
+                 << ",\"event_type\":\"packet\""
+                 << ",\"stage\":\"transmit\""
+                 << ",\"source\":\"" << source
+                 << "\",\"destination\":\"" << destination
+                 << "\",\"current_node\":\"" << currentNode
+                 << "\",\"next_hop\":\"" << nextHop
+                 << "\",\"route\":\"" << route
+                 << "\",\"packet_id\":" << packetId
+                 << ",\"protocol\":\"TCP\"}\n";
+        m_output.flush();
+        if (!m_output)
+        {
+            throw std::runtime_error("Unable to write simulation packet event log.");
+        }
+        ++m_eventCount;
+    }
+
+    bool Close()
+    {
+        m_output.flush();
+        m_output.close();
+        return !m_output.fail();
+    }
+
+  private:
+    static constexpr uint64_t kMaximumEvents = 20000;
+    std::ofstream m_output;
+    uint64_t m_eventCount{0};
+    bool m_limitReported{false};
+};
+
+struct PacketTraceContext
+{
+    SimulationEventLogger* logger{nullptr};
+    RouteMonitorContext* routeMonitor{nullptr};
+    std::string currentNode;
+    std::string nextHop;
+};
+
+static void
+LogTcpPacketTransmit(PacketTraceContext* context, Ptr<const Packet> packet)
+{
+    Ptr<Packet> payload = packet->Copy();
+    PppHeader ppp;
+    if (payload->RemoveHeader(ppp) == 0 || ppp.GetProtocol() != 0x0021)
+    {
+        return;
+    }
+
+    Ipv4Header ipv4;
+    if (payload->PeekHeader(ipv4) == 0 || ipv4.GetProtocol() != 6)
+    {
+        return;
+    }
+
+    std::ostringstream source;
+    std::ostringstream destination;
+    source << ipv4.GetSource();
+    destination << ipv4.GetDestination();
+    context->logger->WritePacket(Simulator::Now().GetSeconds(),
+                                 source.str(),
+                                 destination.str(),
+                                 context->currentNode,
+                                 context->nextHop,
+                                 context->routeMonitor->actualForwardingRoute,
+                                 packet->GetUid());
+}
+
+struct StaticRouteSpec
+{
+    Ptr<Ipv4StaticRouting> routing;
+    Ipv4Address network;
+    Ipv4Mask mask;
+    Ipv4Address nextHop;
+    uint32_t interface{0};
+};
+
+struct DynamicRouteContext
+{
+    std::vector<StaticRouteSpec> routeA;
+    std::vector<StaticRouteSpec> routeB;
+    RouteMonitorContext* monitor{nullptr};
+    std::string activeRoute{"A"};
+    double routeAReferenceCost{0.0};
+    double routeBReferenceCost{0.0};
+};
+
+static void
+InstallStaticRoute(const StaticRouteSpec& route)
+{
+    route.routing->AddNetworkRouteTo(
+        route.network, route.mask, route.nextHop, route.interface);
+}
+
+static void
+RemoveStaticRoute(const StaticRouteSpec& route)
+{
+    bool removed = false;
+    for (uint32_t index = route.routing->GetNRoutes(); index > 0; --index)
+    {
+        const Ipv4RoutingTableEntry entry = route.routing->GetRoute(index - 1);
+        if (entry.IsNetwork() && entry.GetDest() == route.network &&
+            entry.GetDestNetworkMask() == route.mask && entry.GetGateway() == route.nextHop &&
+            entry.GetInterface() == route.interface)
+        {
+            route.routing->RemoveRoute(index - 1);
+            removed = true;
+            break;
+        }
+    }
+    if (!removed)
+    {
+        throw std::runtime_error("Unable to find the expected explicit static route to replace");
+    }
+}
+
+static void
+SwitchDynamicRoute(DynamicRouteContext* context)
+{
+    if (context->activeRoute != "A")
+    {
+        throw std::logic_error("Dynamic route switch expected Route A to be active");
+    }
+
+    // Replace only the matching explicit Route A entries; connected routes remain untouched.
+    for (const StaticRouteSpec& route : context->routeA)
+    {
+        RemoveStaticRoute(route);
+    }
+    for (const StaticRouteSpec& route : context->routeB)
+    {
+        InstallStaticRoute(route);
+    }
+
+    const std::string oldRoute = context->activeRoute;
+    context->activeRoute = "B";
+    context->monitor->actualForwardingRoute = context->activeRoute;
+    std::cout << std::fixed << std::setprecision(6)
+              << "DYNAMIC ROUTE SWITCH: " << oldRoute << " -> " << context->activeRoute
+              << " route_tables_updated=true"
+              << " forward_route_entries_removed=" << context->routeA.size() / 2
+              << " forward_route_entries_installed=" << context->routeB.size() / 2
+              << " return_route_entries_removed=" << context->routeA.size() / 2
+              << " return_route_entries_installed=" << context->routeB.size() / 2
+              << " timestamp_seconds=" << Simulator::Now().GetSeconds()
+              << " route_a_reference_cost=" << context->routeAReferenceCost
+              << " route_b_reference_cost=" << context->routeBReferenceCost
+              << " reason=scheduled switch time; reference costs include unavailable-metric "
+                 "fallbacks and do not drive this switch\n";
+}
+
+struct RouteMonitorSample
+{
+    RouteMetrics metrics;
+    RouteQueueSample queue;
+    RouteCostResult cost;
+    uint64_t requestsSent{0};
+    uint64_t requestsReceived{0};
+    uint64_t rttSamples{0};
+    std::string validity;
+};
+
+static RouteMonitorSample
+BuildRouteMonitorSample(RouteMonitorContext& context,
+                        const std::string& routeLabel,
+                        const std::vector<Ptr<NetDevice>>& queueDevices,
+                        uint64_t requestsSent,
+                        uint64_t requestsReceived,
+                        double rttSum,
+                        uint64_t rttSamples)
+{
+    RouteMonitorSample sample;
+    sample.requestsSent = requestsSent;
+    sample.requestsReceived = requestsReceived;
+    sample.rttSamples = rttSamples;
+    sample.metrics.routerHops = routeLabel == "A" ? 3 : 4;
+    sample.metrics.routerHopsAvailable = true;
+    if (rttSamples > 0)
+    {
+        sample.metrics.delaySeconds = rttSum / static_cast<double>(rttSamples);
+        sample.metrics.delayAvailable = true;
+    }
+    if (requestsSent > 0 && requestsReceived <= requestsSent)
+    {
+        sample.metrics.packetLossRate = static_cast<double>(requestsSent - requestsReceived) /
+                                        static_cast<double>(requestsSent);
+        sample.metrics.packetLossAvailable = true;
+    }
+
+    sample.queue = SampleRouteQueues(queueDevices);
+    if (sample.queue.available)
+    {
+        sample.metrics.queueOccupancyRatio = sample.queue.Ratio();
+        sample.metrics.queueOccupancyAvailable = true;
+    }
+    sample.cost = EvaluateRoute(sample.metrics, context.references, context.weights);
+    sample.validity = sample.cost.measurementsComplete
+                          ? "complete"
+                          : (sample.metrics.delayAvailable || sample.metrics.packetLossAvailable ||
+                                     sample.metrics.queueOccupancyAvailable
+                                 ? "partial"
+                                 : "unavailable");
+    return sample;
+}
+
+static void
+PrintAndWriteMonitoredRoute(RouteMonitorContext& context,
+                            const std::string& routeLabel,
+                            const RouteMonitorSample& sample,
+                            const std::string& selectedRoute,
+                            const std::string& selectionReason)
+{
+
+    std::cout << std::fixed << std::setprecision(6)
+              << "[MONITOR] timestamp_seconds=" << Simulator::Now().GetSeconds()
+              << " route=" << routeLabel << " delay_basis="
+              << (context.trafficRoute == "dynamic" ? "unavailable_mixed_route"
+                                                     : "cumulative_mean_rtt")
+              << " actual_forwarding_route=" << context.actualForwardingRoute
+              << " rtt_samples_cumulative=";
+    if (context.trafficRoute == "dynamic")
+    {
+        std::cout << "unavailable_mixed_route";
+    }
+    else
+    {
+        std::cout << sample.rttSamples;
+    }
+    std::cout << " delay_rtt_ms=";
+    if (sample.metrics.delayAvailable)
+    {
+        std::cout << sample.metrics.delaySeconds * 1000.0;
+    }
+    else
+    {
+        std::cout << "unavailable";
+    }
+    std::cout << " requests_sent_cumulative=";
+    if (context.trafficRoute == "dynamic")
+    {
+        std::cout << "unavailable_mixed_route requests_received_cumulative="
+                     "unavailable_mixed_route";
+    }
+    else
+    {
+        std::cout << sample.requestsSent << " requests_received_cumulative="
+                  << sample.requestsReceived;
+    }
+    std::cout << " packet_loss_rate=";
+    if (sample.metrics.packetLossAvailable)
+    {
+        std::cout << sample.metrics.packetLossRate;
+    }
+    else
+    {
+        std::cout << "unavailable";
+    }
+    std::cout << " queue_occupancy=";
+    if (sample.queue.available)
+    {
+        std::cout << sample.queue.occupancy << "/" << sample.queue.capacity << " "
+                  << QueueUnitName(sample.queue.unit) << " ratio="
+                  << sample.metrics.queueOccupancyRatio;
+    }
+    else
+    {
+        std::cout << "unavailable";
+    }
+    std::cout << " router_hops=" << sample.metrics.routerHops
+              << " measurement_validity=" << sample.validity
+              << " route_cost_valid=" << (sample.cost.valid ? "true" : "false")
+              << " refreshed_weighted_cost=" << sample.cost.cost << "\n";
+
+    if (!context.csvLogger->Write(Simulator::Now().GetSeconds(),
+                                  routeLabel,
+                                  sample.metrics,
+                                  sample.cost.cost,
+                                  sample.rttSamples,
+                                  sample.requestsSent,
+                                  sample.requestsReceived,
+                                  context.trafficRoute != "dynamic",
+                                  sample.queue,
+                                  sample.validity,
+                                  selectedRoute,
+                                  selectionReason))
+    {
+        context.writeFailed = true;
+        std::cerr << "[MONITOR CSV] " << context.csvLogger->Error() << "\n";
+    }
+}
+
+static void
+MonitorRoutes(RouteMonitorContext* context)
+{
+    uint64_t totalRequestsSent = 0;
+    double totalRttSum = 0.0;
+    uint64_t totalRttSamples = 0;
+    if (context->trafficRoute == "A" || context->trafficRoute == "B")
+    {
+        for (const auto& client : *context->clients)
+        {
+            totalRequestsSent += client->RequestsSent();
+            totalRttSum += client->CompletedRttSumSeconds();
+            totalRttSamples += client->CompletedRttSamples();
+        }
+    }
+    const uint64_t totalRequestsReceived =
+        context->trafficRoute == "A" || context->trafficRoute == "B"
+            ? context->server->UniqueRequestsReceived()
+            : 0;
+
+    const RouteMonitorSample routeA = BuildRouteMonitorSample(
+        *context,
+        "A",
+        context->routeAQueueDevices,
+        context->trafficRoute == "A" ? totalRequestsSent : 0,
+        context->trafficRoute == "A" ? totalRequestsReceived : 0,
+        context->trafficRoute == "A" ? totalRttSum : 0.0,
+        context->trafficRoute == "A" ? totalRttSamples : 0);
+    const RouteMonitorSample routeB = BuildRouteMonitorSample(
+        *context,
+        "B",
+        context->routeBQueueDevices,
+        context->trafficRoute == "B" ? totalRequestsSent : 0,
+        context->trafficRoute == "B" ? totalRequestsReceived : 0,
+        context->trafficRoute == "B" ? totalRttSum : 0.0,
+        context->trafficRoute == "B" ? totalRttSamples : 0);
+
+    std::string selectedRoute = "none";
+    std::string selectionReason;
+    const std::string forwardingStatus =
+        context->routeMode == "dynamic"
+            ? "actual forwarding route " + context->actualForwardingRoute +
+                  " follows the scheduled dynamic policy"
+            : "forwarding mode " + context->routeMode + " unchanged";
+    if (routeA.cost.valid && routeB.cost.valid)
+    {
+        const double costDifference = routeA.cost.cost - routeB.cost.cost;
+        if (std::abs(costDifference) <= kRouteCostTieTolerance)
+        {
+            selectedRoute = context->routeMode == "dynamic"
+                                ? context->actualForwardingRoute
+                                : context->trafficRoute;
+            selectionReason = "cost tie within tolerance; retained route " + selectedRoute +
+                              " as preferred; " + forwardingStatus;
+        }
+        else
+        {
+            const RouteMonitorSample& selected = costDifference < 0.0 ? routeA : routeB;
+            selectedRoute = costDifference < 0.0 ? "A" : "B";
+            selectionReason = "lower valid weighted cost";
+            if (!selected.cost.measurementsComplete)
+            {
+                selectionReason +=
+                    "; partial metrics use neutral 0.5 fallback for unavailable inputs";
+            }
+            selectionReason += "; preferred route only; " + forwardingStatus;
+        }
+    }
+    else if (routeA.cost.valid || routeB.cost.valid)
+    {
+        selectedRoute = routeA.cost.valid ? "A" : "B";
+        selectionReason = "only route with valid cost; preferred route only; " +
+                          forwardingStatus;
+    }
+    else
+    {
+        selectionReason = "neither route has a valid cost; retained actual route " +
+                          context->actualForwardingRoute + "; " + forwardingStatus;
+    }
+
+    std::cout << std::fixed << std::setprecision(6)
+              << "[ROUTE-SELECTION] timestamp_seconds=" << Simulator::Now().GetSeconds()
+              << " actual_forwarding_route=" << context->actualForwardingRoute
+              << " route_a_cost=" << routeA.cost.cost
+              << " route_a_cost_valid=" << (routeA.cost.valid ? "true" : "false")
+              << " route_a_measurement_validity=" << routeA.validity
+              << " route_b_cost=" << routeB.cost.cost
+              << " route_b_cost_valid=" << (routeB.cost.valid ? "true" : "false")
+              << " route_b_measurement_validity=" << routeB.validity
+              << " preferred_route=" << selectedRoute
+              << " reason=" << selectionReason << "\n";
+
+    PrintAndWriteMonitoredRoute(*context, "A", routeA, selectedRoute, selectionReason);
+    PrintAndWriteMonitoredRoute(*context, "B", routeB, selectedRoute, selectionReason);
+
+    if (Simulator::Now().GetSeconds() + context->intervalSeconds <= context->stopSeconds + 1e-12)
+    {
+        Simulator::Schedule(Seconds(context->intervalSeconds), &MonitorRoutes, context);
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    CommandLine cmd(__FILE__);
+    std::string routeMode = "global";
+    std::string trafficLoad = "low";
+    std::string csvOutputDirectory;
+    double weightDelay = 0.4;
+    double weightLoss = 0.3;
+    double weightQueue = 0.2;
+    double weightHops = 0.1;
+    double monitorInterval = 1.0;
+    double monitorStartTime = 0.6;
+    bool testRouteMetrics = false;
+    bool topologyOnly = false;
+    uint32_t requestedNodeCount = 7;
+    uint32_t sourceNodeIndex = 0;
+    uint32_t destinationNodeIndex = 6;
+    uint32_t tcpPort = 8080;
+    uint32_t httpClientCount = 3;
+    uint32_t httpRequestSize = 128;
+    double httpRequestInterval = 1.0;
+    uint32_t httpRequestCount = 3;
+    uint32_t httpResponseSize = 128;
+    double dynamicSwitchTime = 3.0;
+    cmd.AddValue("route", "Forwarding mode: global, A, B, or dynamic", routeMode);
+    cmd.AddValue("dynamicSwitchTime",
+                 "Seconds after start to switch dynamic forwarding from Route A to Route B",
+                 dynamicSwitchTime);
+    cmd.AddValue("trafficLoad", "Traffic profile: low, medium, or high", trafficLoad);
+    cmd.AddValue("csvOutputDirectory",
+                 "Directory for per-request CSV output (default: unique trace directory)",
+                 csvOutputDirectory);
+    cmd.AddValue("weightDelay", "Weight for normalized end-to-end delay", weightDelay);
+    cmd.AddValue("weightLoss", "Weight for normalized packet loss", weightLoss);
+    cmd.AddValue("weightQueue", "Weight for normalized queue occupancy", weightQueue);
+    cmd.AddValue("weightHops", "Weight for normalized router hop count", weightHops);
+    cmd.AddValue("monitorInterval", "Route metric sampling interval in seconds", monitorInterval);
+    cmd.AddValue("monitorStartTime", "Route metric monitoring start time in seconds",
+                 monitorStartTime);
+    cmd.AddValue("testRouteMetrics", "Run route metric normalization/cost invariant test",
+                 testRouteMetrics);
+    cmd.AddValue("nodeCount",
+                 "Number of NS-3 nodes (7-254); extra nodes are IPv4-connected leaf hosts",
+                 requestedNodeCount);
+    cmd.AddValue("topologyOnly",
+                 "Create and save topology configuration without starting applications",
+                 topologyOnly);
+    cmd.AddValue("sourceNodeIndex",
+                 "Supported HTTP source node index (currently 0, Client)",
+                 sourceNodeIndex);
+    cmd.AddValue("destinationNodeIndex",
+                 "Supported HTTP destination node index (currently 6, Server)",
+                 destinationNodeIndex);
+    cmd.AddValue("tcpPort", "TCP port for the HTTP-like server", tcpPort);
+    cmd.AddValue("httpClientCount", "Number of TCP HTTP-like clients", httpClientCount);
+    cmd.AddValue("httpRequestSize", "HTTP-like request body size in bytes", httpRequestSize);
+    cmd.AddValue("httpRequestInterval", "Seconds between HTTP-like requests", httpRequestInterval);
+    cmd.AddValue("httpRequestCount", "Number of HTTP-like requests", httpRequestCount);
+    cmd.AddValue("httpResponseSize", "HTTP-like response body size in bytes", httpResponseSize);
+    cmd.Parse(argc, argv);
+
+    const RouteMetricReferences metricReferences;
+    const RouteCostWeights effectiveWeights =
+        NormalizeWeights(weightDelay, weightLoss, weightQueue, weightHops);
+    if (testRouteMetrics)
+    {
+        RunRouteMetricSelfTest(metricReferences, effectiveWeights);
+        return 0;
+    }
+
+    if (trafficLoad != "low" && trafficLoad != "medium" && trafficLoad != "high")
+    {
+        throw std::invalid_argument("--trafficLoad must be low, medium, or high");
+    }
+
+    const bool clientCountOverridden =
+        HasCommandLineOption(argc, argv, "--httpClientCount");
+    const bool requestCountOverridden =
+        HasCommandLineOption(argc, argv, "--httpRequestCount");
+    const bool requestIntervalOverridden =
+        HasCommandLineOption(argc, argv, "--httpRequestInterval");
+
+    uint32_t profileClientCount = 2;
+    uint32_t profileRequestCount = 3;
+    double profileRequestInterval = 2.0;
+    if (trafficLoad == "medium")
+    {
+        profileClientCount = 5;
+        profileRequestCount = 10;
+        profileRequestInterval = 1.0;
+    }
+    else if (trafficLoad == "high")
+    {
+        profileClientCount = 10;
+        profileRequestCount = 20;
+        profileRequestInterval = 0.2;
+    }
+
+    if (!clientCountOverridden)
+    {
+        httpClientCount = profileClientCount;
+    }
+    if (!requestCountOverridden)
+    {
+        httpRequestCount = profileRequestCount;
+    }
+    if (!requestIntervalOverridden)
+    {
+        httpRequestInterval = profileRequestInterval;
+    }
+
+    if (routeMode != "global" && routeMode != "A" &&
+        routeMode != "B" && routeMode != "dynamic")
+    {
+        throw std::invalid_argument("--route must be global, A, B, or dynamic");
+    }
+    if (requestedNodeCount < 7 || requestedNodeCount > 254)
+    {
+        throw std::invalid_argument(
+            "--nodeCount must be between 7 and 254; at least seven nodes are needed "
+            "for both existing routes and at most 254 /24 link subnets are available");
+    }
+    if (sourceNodeIndex != 0 || destinationNodeIndex != 6)
+    {
+        throw std::invalid_argument(
+            "--sourceNodeIndex must be 0 (Client) and --destinationNodeIndex must be "
+            "6 (Server); auxiliary leaf nodes are not supported HTTP endpoints");
+    }
+    if (tcpPort == 0 || tcpPort > 65535)
+    {
+        throw std::invalid_argument("--tcpPort must be between 1 and 65535");
+    }
+    if (httpClientCount == 0 || httpRequestSize == 0 || httpRequestCount == 0 ||
+        httpResponseSize == 0)
+    {
+        throw std::invalid_argument(
+            "--httpClientCount, --httpRequestSize, --httpRequestCount, and "
+            "--httpResponseSize must be positive");
+    }
+    if (!std::isfinite(httpRequestInterval) || httpRequestInterval <= 0.0)
+    {
+        throw std::invalid_argument("--httpRequestInterval must be a finite positive number");
+    }
+    if (!std::isfinite(monitorInterval) || monitorInterval <= 0.0)
+    {
+        throw std::invalid_argument("--monitorInterval must be a finite positive number");
+    }
+    if (!std::isfinite(monitorStartTime) || monitorStartTime <= 0.0)
+    {
+        throw std::invalid_argument("--monitorStartTime must be a finite positive number");
+    }
+    if (!std::isfinite(dynamicSwitchTime) || dynamicSwitchTime <= 0.0)
+    {
+        throw std::invalid_argument("--dynamicSwitchTime must be a finite positive number");
+    }
+
+    // 1. Create the fixed routing core plus requested auxiliary leaf hosts.
+    NodeContainer nodes;
+    nodes.Create(requestedNodeCount);
+
+    Ptr<Node> client = nodes.Get(sourceNodeIndex);
+    Ptr<Node> r1 = nodes.Get(1);
+    Ptr<Node> r2 = nodes.Get(2);
+    Ptr<Node> r3 = nodes.Get(3);
+    Ptr<Node> r4 = nodes.Get(4);
+    Ptr<Node> r5 = nodes.Get(5);
+    Ptr<Node> server = nodes.Get(destinationNodeIndex);
+
+    // 2. Install the Internet protocol stack.
+    InternetStackHelper internet;
+    internet.Install(nodes);
+
+    // 3. Configure network links.
+    PointToPointHelper link;
+    link.SetDeviceAttribute("DataRate", StringValue(kPointToPointDataRate));
+    link.SetChannelAttribute("Delay", TimeValue(Seconds(kPointToPointDelaySeconds)));
+
+    NetDeviceContainer dClientR1 = link.Install(client, r1);
+
+    // Route A: R1 -> R2 -> R5.
+    NetDeviceContainer dR1R2 = link.Install(r1, r2);
+    NetDeviceContainer dR2R5 = link.Install(r2, r5);
+
+    // Route B: R1 -> R3 -> R4 -> R5.
+    NetDeviceContainer dR1R3 = link.Install(r1, r3);
+    NetDeviceContainer dR3R4 = link.Install(r3, r4);
+    NetDeviceContainer dR4R5 = link.Install(r4, r5);
+
+    NetDeviceContainer dR5Server = link.Install(r5, server);
+    std::vector<NetDeviceContainer> dAuxiliary;
+    std::vector<std::string> auxiliaryNames;
+    dAuxiliary.reserve(requestedNodeCount - 7);
+    auxiliaryNames.reserve(requestedNodeCount - 7);
+    for (uint32_t nodeIndex = 7; nodeIndex < requestedNodeCount; ++nodeIndex)
+    {
+        std::ostringstream name;
+        name << "aux-" << nodeIndex - 6;
+        auxiliaryNames.push_back(name.str());
+        dAuxiliary.push_back(link.Install(r1, nodes.Get(nodeIndex)));
+    }
+
+    // 4. Assign a separate IPv4 subnet to every link.
+    Ipv4AddressHelper address;
+    uint32_t subnet = 1;
+
+    auto assignAddress = [&address, &subnet](
+        NetDeviceContainer devices) {
+        std::ostringstream network;
+        network << "10.1." << subnet++ << ".0";
+
+        address.SetBase(
+            Ipv4Address(network.str().c_str()),
+            Ipv4Mask("255.255.255.0"));
+
+        return address.Assign(devices);
+    };
+
+    Ipv4InterfaceContainer iClientR1 = assignAddress(dClientR1);
+    Ipv4InterfaceContainer iR1R2 = assignAddress(dR1R2);
+    Ipv4InterfaceContainer iR2R5 = assignAddress(dR2R5);
+    Ipv4InterfaceContainer iR1R3 = assignAddress(dR1R3);
+    Ipv4InterfaceContainer iR3R4 = assignAddress(dR3R4);
+    Ipv4InterfaceContainer iR4R5 = assignAddress(dR4R5);
+    Ipv4InterfaceContainer iR5Server = assignAddress(dR5Server);
+    std::vector<Ipv4InterfaceContainer> iAuxiliary;
+    iAuxiliary.reserve(dAuxiliary.size());
+    for (const auto& devices : dAuxiliary)
+    {
+        iAuxiliary.push_back(assignAddress(devices));
+    }
+
+    // The server has one network interface plus loopback.
+    Ipv4Address serverAddress =
+        server->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+
+    RouteMetrics routeA;
+    routeA.delaySeconds = 4.0 * kPointToPointDelaySeconds;
+    routeA.routerHops = 3;
+    routeA.delayAvailable = true;
+    routeA.routerHopsAvailable = true;
+
+    RouteMetrics routeB;
+    routeB.delaySeconds = 5.0 * kPointToPointDelaySeconds;
+    routeB.routerHops = 4;
+    routeB.delayAvailable = true;
+    routeB.routerHopsAvailable = true;
+
+    const RouteCostResult routeACost =
+        EvaluateRoute(routeA, metricReferences, effectiveWeights);
+    const RouteCostResult routeBCost =
+        EvaluateRoute(routeB, metricReferences, effectiveWeights);
+
+    std::vector<StaticRouteSpec> dynamicRouteA;
+    std::vector<StaticRouteSpec> dynamicRouteB;
+    if (routeMode == "global")
+    {
+        Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+    }
+    else
+    {
+        Ipv4StaticRoutingHelper staticRoutingHelper;
+        Ipv4Address clientNetwork("10.1.1.0");
+        Ipv4Address serverNetwork("10.1.7.0");
+
+        auto makeNetworkRoute = [&staticRoutingHelper](
+                                    Ptr<Node> node,
+                                    Ipv4Address network,
+                                    Ipv4Address nextHop,
+                                    Ptr<NetDevice> egressDevice) {
+            Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+            int32_t interface = ipv4->GetInterfaceForDevice(egressDevice);
+            if (interface < 0)
+            {
+                throw std::runtime_error("Route device has no IPv4 interface");
+            }
+
+            return StaticRouteSpec{staticRoutingHelper.GetStaticRouting(ipv4),
+                                   network,
+                                   Ipv4Mask("255.255.255.0"),
+                                   nextHop,
+                                   static_cast<uint32_t>(interface)};
+        };
+        auto addNetworkRoute = [&makeNetworkRoute](Ptr<Node> node,
+                                                   Ipv4Address network,
+                                                   Ipv4Address nextHop,
+                                                   Ptr<NetDevice> egressDevice) {
+            const StaticRouteSpec route =
+                makeNetworkRoute(node, network, nextHop, egressDevice);
+            InstallStaticRoute(route);
+            return route;
+        };
+
+        if (routeMode == "A")
+        {
+            addNetworkRoute(client, serverNetwork, iClientR1.GetAddress(1), dClientR1.Get(0));
+            addNetworkRoute(r1, serverNetwork, iR1R2.GetAddress(1), dR1R2.Get(0));
+            addNetworkRoute(r2, serverNetwork, iR2R5.GetAddress(1), dR2R5.Get(0));
+            addNetworkRoute(server, clientNetwork, iR5Server.GetAddress(0), dR5Server.Get(1));
+            addNetworkRoute(r5, clientNetwork, iR2R5.GetAddress(0), dR2R5.Get(1));
+            addNetworkRoute(r2, clientNetwork, iR1R2.GetAddress(0), dR1R2.Get(1));
+        }
+        else if (routeMode == "B")
+        {
+            addNetworkRoute(client, serverNetwork, iClientR1.GetAddress(1), dClientR1.Get(0));
+            addNetworkRoute(r1, serverNetwork, iR1R3.GetAddress(1), dR1R3.Get(0));
+            addNetworkRoute(r3, serverNetwork, iR3R4.GetAddress(1), dR3R4.Get(0));
+            addNetworkRoute(r4, serverNetwork, iR4R5.GetAddress(1), dR4R5.Get(0));
+            addNetworkRoute(server, clientNetwork, iR5Server.GetAddress(0), dR5Server.Get(1));
+            addNetworkRoute(r5, clientNetwork, iR4R5.GetAddress(0), dR4R5.Get(1));
+            addNetworkRoute(r4, clientNetwork, iR3R4.GetAddress(0), dR3R4.Get(1));
+            addNetworkRoute(r3, clientNetwork, iR1R3.GetAddress(0), dR1R3.Get(1));
+        }
+        else
+        {
+            auto addPlannedRoute = [&makeNetworkRoute](
+                                       std::vector<StaticRouteSpec>& plan,
+                                       Ptr<Node> node,
+                                       Ipv4Address network,
+                                       Ipv4Address nextHop,
+                                       Ptr<NetDevice> egressDevice,
+                                       bool installInitially) {
+                plan.push_back(makeNetworkRoute(node, network, nextHop, egressDevice));
+                if (installInitially)
+                {
+                    InstallStaticRoute(plan.back());
+                }
+            };
+            addPlannedRoute(dynamicRouteA,
+                            client,
+                            serverNetwork,
+                            iClientR1.GetAddress(1),
+                            dClientR1.Get(0),
+                            true);
+            addPlannedRoute(dynamicRouteA,
+                            r1,
+                            serverNetwork,
+                            iR1R2.GetAddress(1),
+                            dR1R2.Get(0),
+                            true);
+            addPlannedRoute(dynamicRouteA,
+                            r2,
+                            serverNetwork,
+                            iR2R5.GetAddress(1),
+                            dR2R5.Get(0),
+                            true);
+            addPlannedRoute(dynamicRouteA,
+                            server,
+                            clientNetwork,
+                            iR5Server.GetAddress(0),
+                            dR5Server.Get(1),
+                            true);
+            addPlannedRoute(dynamicRouteA,
+                            r5,
+                            clientNetwork,
+                            iR2R5.GetAddress(0),
+                            dR2R5.Get(1),
+                            true);
+            addPlannedRoute(dynamicRouteA,
+                            r2,
+                            clientNetwork,
+                            iR1R2.GetAddress(0),
+                            dR1R2.Get(1),
+                            true);
+
+            addPlannedRoute(dynamicRouteB,
+                            client,
+                            serverNetwork,
+                            iClientR1.GetAddress(1),
+                            dClientR1.Get(0),
+                            false);
+            addPlannedRoute(dynamicRouteB,
+                            r1,
+                            serverNetwork,
+                            iR1R3.GetAddress(1),
+                            dR1R3.Get(0),
+                            false);
+            addPlannedRoute(dynamicRouteB,
+                            r3,
+                            serverNetwork,
+                            iR3R4.GetAddress(1),
+                            dR3R4.Get(0),
+                            false);
+            addPlannedRoute(dynamicRouteB,
+                            r4,
+                            serverNetwork,
+                            iR4R5.GetAddress(1),
+                            dR4R5.Get(0),
+                            false);
+            addPlannedRoute(dynamicRouteB,
+                            server,
+                            clientNetwork,
+                            iR5Server.GetAddress(0),
+                            dR5Server.Get(1),
+                            false);
+            addPlannedRoute(dynamicRouteB,
+                            r5,
+                            clientNetwork,
+                            iR4R5.GetAddress(0),
+                            dR4R5.Get(1),
+                            false);
+            addPlannedRoute(dynamicRouteB,
+                            r4,
+                            clientNetwork,
+                            iR3R4.GetAddress(0),
+                            dR3R4.Get(1),
+                            false);
+            addPlannedRoute(dynamicRouteB,
+                            r3,
+                            clientNetwork,
+                            iR1R3.GetAddress(0),
+                            dR1R3.Get(1),
+                            false);
+        }
+    }
+
+    const std::filesystem::path resultsRoot =
+        std::filesystem::path("..") / "results" / "webflow-route-tests";
+    std::filesystem::create_directories(resultsRoot);
+    const std::string runId = std::to_string(
+        std::chrono::system_clock::now().time_since_epoch().count());
+    const std::filesystem::path traceDirectory =
+        resultsRoot / ("run-" + routeMode + "-" + runId);
+    if (!std::filesystem::create_directory(traceDirectory))
+    {
+        throw std::runtime_error("Trace directory already exists: " + traceDirectory.string());
+    }
+
+    const std::filesystem::path csvDirectory = csvOutputDirectory.empty()
+                                                   ? traceDirectory
+                                                   : std::filesystem::path(csvOutputDirectory);
+    std::error_code directoryError;
+    std::filesystem::create_directories(csvDirectory, directoryError);
+    if (directoryError)
+    {
+        throw std::runtime_error("Unable to create CSV output directory " +
+                                 csvDirectory.string() + ": " + directoryError.message());
+    }
+    const std::filesystem::path csvPath =
+        csvDirectory / (csvOutputDirectory.empty() ? "http-requests.csv"
+                                                   : "http-requests-" + runId + ".csv");
+    if (std::filesystem::exists(csvPath))
+    {
+        throw std::runtime_error("Refusing to overwrite existing HTTP request CSV: " +
+                                 csvPath.string());
+    }
+    auto csvLogger = std::make_shared<HttpCsvLogger>(csvPath);
+
+    const std::filesystem::path routeMetricsCsvPath =
+        csvDirectory / ("route-metrics-" + runId + ".csv");
+    if (std::filesystem::exists(routeMetricsCsvPath))
+    {
+        throw std::runtime_error("Refusing to overwrite existing route metrics CSV: " +
+                                 routeMetricsCsvPath.string());
+    }
+    auto routeMetricsCsv =
+        std::make_shared<RouteMetricsCsvLogger>(routeMetricsCsvPath);
+
+    std::vector<std::filesystem::path> traceFiles;
+    auto enableLinkPcap = [&link, &traceDirectory, &traceFiles](
+                              const std::string& linkName,
+                              const std::string& endpointA,
+                              const std::string& endpointB,
+                              NetDeviceContainer devices) {
+        const std::string endpoints[] = {endpointA, endpointB};
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            std::filesystem::path filename =
+                traceDirectory / (linkName + "-" + endpoints[i] + ".pcap");
+            link.EnablePcap(filename.string(), devices.Get(i), false, true);
+            traceFiles.push_back(filename);
+        }
+    };
+
+    enableLinkPcap("client-r1", "client", "r1", dClientR1);
+    enableLinkPcap("r1-r2", "r1", "r2", dR1R2);
+    enableLinkPcap("r2-r5", "r2", "r5", dR2R5);
+    enableLinkPcap("r1-r3", "r1", "r3", dR1R3);
+    enableLinkPcap("r3-r4", "r3", "r4", dR3R4);
+    enableLinkPcap("r4-r5", "r4", "r5", dR4R5);
+    enableLinkPcap("r5-server", "r5", "server", dR5Server);
+    for (uint32_t index = 0; index < dAuxiliary.size(); ++index)
+    {
+        enableLinkPcap("r1-" + auxiliaryNames[index],
+                       "r1",
+                       auxiliaryNames[index],
+                       dAuxiliary[index]);
+    }
+
+    const auto nodesConfigPath = traceDirectory / "topology-nodes.csv";
+    std::ofstream nodesConfig(nodesConfigPath);
+    const auto linksConfigPath = traceDirectory / "topology-links.csv";
+    std::ofstream linksConfig(linksConfigPath);
+    if (!nodesConfig || !linksConfig)
+    {
+        throw std::runtime_error("Unable to create topology configuration files in " +
+                                 traceDirectory.string());
+    }
+    nodesConfig << "node_index,ns3_node_id,role,supported_source,supported_destination\n";
+    linksConfig << "link,endpoint_a,endpoint_b,ipv4_a,ipv4_b,bandwidth,delay_seconds\n";
+    std::cout << "\n=== Created NS-3 Topology ===\n";
+    std::cout << "Requested node count: " << requestedNodeCount << "\n";
+    std::cout << "Actual nodes created: " << nodes.GetN() << "\n";
+    for (uint32_t index = 0; index < nodes.GetN(); ++index)
+    {
+        std::string role;
+        if (index == 0)
+        {
+            role = "Client";
+        }
+        else if (index == 1)
+        {
+            role = "R1";
+        }
+        else if (index == 2)
+        {
+            role = "R2";
+        }
+        else if (index == 3)
+        {
+            role = "R3";
+        }
+        else if (index == 4)
+        {
+            role = "R4";
+        }
+        else if (index == 5)
+        {
+            role = "R5";
+        }
+        else if (index == 6)
+        {
+            role = "Server";
+        }
+        else
+        {
+            role = auxiliaryNames[index - 7];
+        }
+        std::cout << "Node: index=" << index
+                  << " ns3_id=" << nodes.Get(index)->GetId()
+                  << " role=" << role
+                  << " supported_source=" << (index == 0 ? "true" : "false")
+                  << " supported_destination=" << (index == 6 ? "true" : "false")
+                  << "\n";
+        nodesConfig << index << "," << nodes.Get(index)->GetId() << "," << role << ","
+                    << (index == 0 ? "true" : "false") << ","
+                    << (index == 6 ? "true" : "false") << "\n";
+    }
+    auto writeLinkConfiguration = [&linksConfig](
+                                      const std::string& name,
+                                      const std::string& endpointA,
+                                      const std::string& endpointB,
+                                      const Ipv4InterfaceContainer& interfaces) {
+        const Ipv4Address addressA = interfaces.GetAddress(0);
+        const Ipv4Address addressB = interfaces.GetAddress(1);
+        std::cout << "Link: name=" << name
+                  << " endpoint_a=" << endpointA
+                  << " endpoint_b=" << endpointB
+                  << " ipv4_a=" << addressA
+                  << " ipv4_b=" << addressB << "\n";
+        linksConfig << name << "," << endpointA << "," << endpointB << ","
+                    << addressA << "," << addressB << ","
+                    << kPointToPointDataRate << "," << kPointToPointDelaySeconds << "\n";
+    };
+    writeLinkConfiguration("client-r1", "Client", "R1", iClientR1);
+    writeLinkConfiguration("r1-r2", "R1", "R2", iR1R2);
+    writeLinkConfiguration("r2-r5", "R2", "R5", iR2R5);
+    writeLinkConfiguration("r1-r3", "R1", "R3", iR1R3);
+    writeLinkConfiguration("r3-r4", "R3", "R4", iR3R4);
+    writeLinkConfiguration("r4-r5", "R4", "R5", iR4R5);
+    writeLinkConfiguration("r5-server", "R5", "Server", iR5Server);
+    for (uint32_t index = 0; index < iAuxiliary.size(); ++index)
+    {
+        writeLinkConfiguration("r1-" + auxiliaryNames[index],
+                               "R1",
+                               auxiliaryNames[index],
+                               iAuxiliary[index]);
+    }
+    nodesConfig.close();
+    linksConfig.close();
+    std::cout << "Topology configuration files: "
+              << std::filesystem::absolute(nodesConfigPath).string() << ", "
+              << std::filesystem::absolute(linksConfigPath).string() << "\n";
+    std::cout << "Supported HTTP endpoints: Client (node index 0) -> Server (node index 6)\n";
+    std::cout << "Auxiliary nodes are IPv4-connected leaf hosts on R1; they are not on "
+                 "Route A or Route B.\n";
+    std::cout << "Trace directory: "
+              << std::filesystem::absolute(traceDirectory).string() << "\n";
+    if (topologyOnly)
+    {
+        std::cout << "Route mode: " << routeMode << "\n";
+        std::cout << "Topology creation complete; simulation applications were not started.\n";
+        return 0;
+    }
+
+    SimulationEventLogger simulationEvents(traceDirectory / "simulation-events.jsonl");
+
+    // 5. Install a UDP echo server.
+    UdpEchoServerHelper echoServer(9);
+    ApplicationContainer serverApps =
+        echoServer.Install(server);
+
+    serverApps.Start(Seconds(0.5));
+    serverApps.Stop(Seconds(6.0));
+
+    // 6. Install a UDP echo client.
+    UdpEchoClientHelper echoClient(serverAddress, 9);
+    echoClient.SetAttribute("MaxPackets", UintegerValue(5));
+    echoClient.SetAttribute("Interval", TimeValue(Seconds(1.0)));
+    echoClient.SetAttribute("PacketSize", UintegerValue(64));
+
+    ApplicationContainer clientApps =
+        echoClient.Install(client);
+
+    clientApps.Start(Seconds(1.0));
+    clientApps.Stop(Seconds(6.0));
+
+    constexpr double clientStartStaggerSeconds = 0.05;
+    const double lastClientStartSeconds =
+        0.75 + static_cast<double>(httpClientCount - 1) * clientStartStaggerSeconds;
+    const uint64_t totalRequestCount =
+        static_cast<uint64_t>(httpClientCount) * httpRequestCount;
+    const double requestScheduleSeconds =
+        httpRequestInterval * static_cast<double>(httpRequestCount - 1);
+    const double firstClientStartSeconds = 0.75;
+    const double transferBytes = static_cast<double>(totalRequestCount) *
+                                 (httpRequestSize + httpResponseSize + 512.0);
+    const double simulationStopSeconds =
+        std::max(6.5,
+                 lastClientStartSeconds + requestScheduleSeconds +
+                     transferBytes * 8.0 / 10000000.0 + 1.0);
+    if (!std::isfinite(simulationStopSeconds))
+    {
+        throw std::invalid_argument("HTTP-like traffic configuration produces an invalid run time");
+    }
+    if (routeMode == "dynamic" && dynamicSwitchTime >= simulationStopSeconds)
+    {
+        throw std::invalid_argument(
+            "--dynamicSwitchTime must occur before the simulation stop time (" +
+            FormatSeconds(simulationStopSeconds) + " seconds)");
+    }
+    const double expectedTrafficEndSeconds =
+        lastClientStartSeconds + requestScheduleSeconds +
+        transferBytes * 8.0 / 10000000.0 + 0.1;
+    if (routeMode == "dynamic" &&
+        (dynamicSwitchTime <= firstClientStartSeconds ||
+         dynamicSwitchTime >= expectedTrafficEndSeconds))
+    {
+        throw std::invalid_argument(
+            "--dynamicSwitchTime must fall inside the expected HTTP traffic window (" +
+            FormatSeconds(firstClientStartSeconds) + " to " +
+            FormatSeconds(expectedTrafficEndSeconds) + " seconds)");
+    }
+    if (monitorStartTime >= expectedTrafficEndSeconds ||
+        monitorStartTime >= simulationStopSeconds)
+    {
+        throw std::invalid_argument(
+            "--monitorStartTime must precede expected traffic completion and simulation stop");
+    }
+    const Time simulationStopTime = Seconds(simulationStopSeconds);
+
+    Ptr<WebFlowHttpServer> tcpServer = CreateObject<WebFlowHttpServer>();
+    tcpServer->Configure(static_cast<uint16_t>(tcpPort),
+                         httpClientCount,
+                         httpRequestCount,
+                         httpRequestSize,
+                         httpResponseSize,
+                         trafficLoad,
+                         routeMode);
+    server->AddApplication(tcpServer);
+    tcpServer->SetStartTime(Seconds(0.5));
+    tcpServer->SetStopTime(simulationStopTime);
+
+    std::vector<Ptr<WebFlowHttpClient>> tcpClients;
+    tcpClients.reserve(httpClientCount);
+    for (uint32_t clientIndex = 0; clientIndex < httpClientCount; ++clientIndex)
+    {
+        const uint32_t clientId = clientIndex + 1;
+        Ptr<WebFlowHttpClient> tcpClient = CreateObject<WebFlowHttpClient>();
+        tcpClient->Configure(serverAddress,
+                             static_cast<uint16_t>(tcpPort),
+                             clientId,
+                             httpRequestSize,
+                             Seconds(httpRequestInterval),
+                             httpRequestCount,
+                             httpResponseSize,
+                             trafficLoad,
+                             routeMode,
+                             csvLogger);
+        client->AddApplication(tcpClient);
+        tcpClient->SetStartTime(
+            Seconds(0.75 + clientIndex * clientStartStaggerSeconds));
+        tcpClient->SetStopTime(simulationStopTime);
+        tcpClients.push_back(tcpClient);
+    }
+
+    RouteMonitorContext routeMonitor;
+    routeMonitor.trafficLoad = trafficLoad;
+    routeMonitor.routeMode = routeMode;
+    routeMonitor.trafficRoute =
+        routeMode == "dynamic" ? "dynamic" : (routeMode == "B" ? "B" : "A");
+    routeMonitor.actualForwardingRoute =
+        routeMode == "dynamic" ? "A" : (routeMode == "B" ? "B" : routeMode);
+    routeMonitor.intervalSeconds = monitorInterval;
+    routeMonitor.stopSeconds = simulationStopSeconds;
+    routeMonitor.clients = &tcpClients;
+    routeMonitor.server = tcpServer;
+    routeMonitor.references = metricReferences;
+    routeMonitor.weights = effectiveWeights;
+    routeMonitor.csvLogger = routeMetricsCsv;
+
+    auto addQueueDevices = [](std::vector<Ptr<NetDevice>>& queueDevices,
+                              const NetDeviceContainer& devices) {
+        for (uint32_t index = 0; index < devices.GetN(); ++index)
+        {
+            queueDevices.push_back(devices.Get(index));
+        }
+    };
+    addQueueDevices(routeMonitor.routeAQueueDevices, dClientR1);
+    addQueueDevices(routeMonitor.routeAQueueDevices, dR1R2);
+    addQueueDevices(routeMonitor.routeAQueueDevices, dR2R5);
+    addQueueDevices(routeMonitor.routeAQueueDevices, dR5Server);
+    addQueueDevices(routeMonitor.routeBQueueDevices, dClientR1);
+    addQueueDevices(routeMonitor.routeBQueueDevices, dR1R3);
+    addQueueDevices(routeMonitor.routeBQueueDevices, dR3R4);
+    addQueueDevices(routeMonitor.routeBQueueDevices, dR4R5);
+    addQueueDevices(routeMonitor.routeBQueueDevices, dR5Server);
+
+    std::vector<std::unique_ptr<PacketTraceContext>> packetTraceContexts;
+    packetTraceContexts.reserve(nodes.GetN() * 2);
+    auto tracePacketLink = [&packetTraceContexts, &simulationEvents, &routeMonitor](
+                               const NetDeviceContainer& devices,
+                               const std::string& endpointA,
+                               const std::string& endpointB) {
+        const std::pair<std::string, std::string> endpoints[] = {
+            {endpointA, endpointB},
+            {endpointB, endpointA},
+        };
+        for (uint32_t index = 0; index < 2; ++index)
+        {
+            Ptr<PointToPointNetDevice> device =
+                DynamicCast<PointToPointNetDevice>(devices.Get(index));
+            if (!device)
+            {
+                throw std::runtime_error("Unable to attach packet event trace to " +
+                                         endpoints[index].first);
+            }
+            auto context = std::make_unique<PacketTraceContext>();
+            context->logger = &simulationEvents;
+            context->routeMonitor = &routeMonitor;
+            context->currentNode = endpoints[index].first;
+            context->nextHop = endpoints[index].second;
+            PacketTraceContext* contextPointer = context.get();
+            packetTraceContexts.push_back(std::move(context));
+            if (!device->TraceConnectWithoutContext(
+                    "MacTx",
+                    MakeBoundCallback(&LogTcpPacketTransmit, contextPointer)))
+            {
+                throw std::runtime_error("Unable to connect the NS-3 MacTx packet trace.");
+            }
+        }
+    };
+    tracePacketLink(dClientR1, "Client", "R1");
+    tracePacketLink(dR1R2, "R1", "R2");
+    tracePacketLink(dR2R5, "R2", "R5");
+    tracePacketLink(dR1R3, "R1", "R3");
+    tracePacketLink(dR3R4, "R3", "R4");
+    tracePacketLink(dR4R5, "R4", "R5");
+    tracePacketLink(dR5Server, "R5", "Server");
+    for (uint32_t index = 0; index < dAuxiliary.size(); ++index)
+    {
+        tracePacketLink(dAuxiliary[index], "R1", auxiliaryNames[index]);
+    }
+
+    // 7. Display actual UDP send and receive activity.
+    LogComponentEnable(
+        "UdpEchoClientApplication", LOG_LEVEL_INFO);
+    LogComponentEnable(
+        "UdpEchoServerApplication", LOG_LEVEL_INFO);
+
+    std::cout << "\n=== WebFlow Route Verification ===\n";
+    std::cout << "Route mode: " << routeMode << "\n";
+    std::cout << "Traffic load profile: " << trafficLoad << "\n";
+    std::cout << "Requested node count: " << requestedNodeCount << "\n";
+    std::cout << "Actual nodes created: " << nodes.GetN() << "\n";
+    std::cout << "Profile precedence: explicitly supplied client/count/interval options "
+                 "override profile values\n";
+    std::cout << "Forwarding: "
+              << (routeMode == "global"
+                      ? "NS-3 global-routing baseline"
+                      : (routeMode == "dynamic" ? "explicit static routes with scheduled A-to-B switch"
+                                                 : "explicit static route"))
+              << "\n";
+    std::cout << "Server IPv4: " << serverAddress << "\n";
+    std::cout << "Link bandwidth: 10 Mbps\n";
+    std::cout << "Per-link delay: 5 ms\n";
+    std::cout << "\n=== Advisory Weighted Route Cost (informational; not a dynamic switch trigger) ===\n";
+    std::cout << "Metric source: delay and router hops are topology-derived estimates; "
+                 "loss and queue occupancy are not measured in this phase.\n";
+    std::cout << "Normalization references: delay=50 ms, loss=0.10, queue=1.0, "
+                 "router_hops=5; unavailable metrics use normalized fallback 0.5.\n";
+    std::cout << "Effective weights: delay=" << effectiveWeights.delay
+              << ", loss=" << effectiveWeights.packetLoss
+              << ", queue=" << effectiveWeights.queueOccupancy
+              << ", hops=" << effectiveWeights.routerHops << "\n";
+    PrintRouteCost("Route A (3 router hops)", routeACost);
+    PrintRouteCost("Route B (4 router hops)", routeBCost);
+    if (routeMode == "dynamic")
+    {
+        std::cout << "Dynamic policy: Route A initially; scheduled switch to Route B at "
+                  << dynamicSwitchTime
+                  << " seconds. Reference costs are informational and unavailable metric "
+                     "fallbacks are not treated as switching evidence.\n";
+    }
+    else if (!routeACost.valid || !routeBCost.valid)
+    {
+        std::cout << "Initial route selection: unavailable because Phase 1 reference inputs "
+                     "include unmeasured metrics; forwarding mode "
+                  << routeMode << " remains unchanged.\n";
+    }
+    else if (std::abs(routeACost.cost - routeBCost.cost) <= kRouteCostTieTolerance)
+    {
+        std::cout << "Route cost result: tie within " << kRouteCostTieTolerance
+                  << "; no preferred route. Existing forwarding mode " << routeMode
+                  << " remains unchanged.\n";
+    }
+    else
+    {
+        std::cout << "Lower-cost route (advisory): "
+                  << (routeACost.cost < routeBCost.cost ? "Route A" : "Route B")
+                  << ". Existing forwarding mode " << routeMode
+                  << " remains unchanged; no route updates are performed.\n";
+    }
+    std::cout << "[UDP test] Echo packets scheduled: 5 on port 9\n";
+    std::cout << "[TCP test] HTTP-like TCP port: " << tcpPort << "\n";
+    std::cout << "[TCP test] Clients: " << httpClientCount
+              << ", requests per client: " << httpRequestCount
+              << ", request body: " << httpRequestSize << " bytes"
+              << ", interval: " << httpRequestInterval << " s"
+              << ", response body: " << httpResponseSize << " bytes\n\n";
+    std::cout << "[TCP test] Total expected requests/responses: " << totalRequestCount << "/"
+              << totalRequestCount << "\n";
+    std::cout << "[TCP test] CSV log: " << std::filesystem::absolute(csvPath).string() << "\n";
+    std::cout << "[MONITOR] interval: " << monitorInterval << " s, start: "
+              << monitorStartTime << " s, CSV: "
+              << std::filesystem::absolute(routeMetricsCsvPath).string() << "\n";
+    if (routeMode == "dynamic")
+    {
+        std::cout << "[MONITOR] HTTP delay/loss attribution: unavailable in dynamic mode "
+                     "because TCP counters are cumulative across the route switch; actual "
+                     "forwarding starts on Route A.\n";
+    }
+    else
+    {
+        std::cout << "[MONITOR] application traffic path for delay/loss: Route "
+                  << routeMonitor.trafficRoute;
+        if (routeMode == "global")
+        {
+            std::cout << " (shortest path in this topology); metrics for the untraversed candidate "
+                         "remain unavailable";
+        }
+        std::cout << "\n";
+    }
+    std::cout << "Trace directory: "
+              << std::filesystem::absolute(traceDirectory).string() << "\n";
+    for (const auto& traceFile : traceFiles)
+    {
+        std::cout << "PCAP: " << std::filesystem::absolute(traceFile).string() << "\n";
+    }
+    if (routeMode == "global")
+    {
+        std::cout << "Route selection is determined by NS-3 global shortest-path routing; "
+                     "it is not the future weighted dynamic-routing algorithm.\n";
+    }
+
+    DynamicRouteContext dynamicRouteContext;
+    if (routeMode == "dynamic")
+    {
+        dynamicRouteContext.routeA = std::move(dynamicRouteA);
+        dynamicRouteContext.routeB = std::move(dynamicRouteB);
+        dynamicRouteContext.monitor = &routeMonitor;
+        dynamicRouteContext.routeAReferenceCost = routeACost.cost;
+        dynamicRouteContext.routeBReferenceCost = routeBCost.cost;
+        std::cout << "[DYNAMIC ROUTE] Route A installed initially; switch to Route B scheduled at "
+                  << dynamicSwitchTime << " seconds\n";
+    }
+
+    Simulator::Schedule(Seconds(monitorStartTime), &MonitorRoutes, &routeMonitor);
+    if (routeMode == "dynamic")
+    {
+        // The callback replaces the forward and return static routes at the requested time.
+        Simulator::Schedule(Seconds(dynamicSwitchTime),
+                            &SwitchDynamicRoute,
+                            &dynamicRouteContext);
+    }
+    Simulator::Stop(simulationStopTime);
+    std::cout << "Simulation start: 0 seconds\n";
+    Simulator::Run();
+    std::cout << "Simulation complete: " << Simulator::Now().GetSeconds() << " seconds\n";
+    const bool simulationEventsWriteSucceeded = simulationEvents.Close();
+    packetTraceContexts.clear();
+    bool routeMetricsCsvSucceeded = !routeMonitor.writeFailed;
+    routeMetricsCsvSucceeded = routeMetricsCsv->Close() && routeMetricsCsvSucceeded;
+    if (!routeMetricsCsvSucceeded)
+    {
+        std::cerr << "[MONITOR CSV] " << routeMetricsCsv->Error() << "\n";
+    }
+    bool csvWriteSucceeded = true;
+    for (const auto& tcpClient : tcpClients)
+    {
+        csvWriteSucceeded = tcpClient->FinalizeCsvRows() && csvWriteSucceeded;
+    }
+    csvWriteSucceeded = csvLogger->Close() && csvWriteSucceeded;
+    if (!csvWriteSucceeded)
+    {
+        std::cerr << "[CSV] " << csvLogger->Error() << "\n";
+    }
+
+    uint64_t totalRequestsSent = 0;
+    uint64_t totalSuccessfulResponses = 0;
+    uint64_t totalFailedResponses = 0;
+    uint64_t connectedClients = 0;
+    uint64_t failedConnections = 0;
+    uint64_t totalDuplicateResponses = 0;
+    uint64_t totalMalformedResponses = 0;
+    uint64_t totalRequestPayloadBytesSent = 0;
+    uint64_t totalResponsePayloadBytesReceived = 0;
+    uint64_t totalValidatedResponsePayloadBytesReceived = 0;
+    double totalRttSeconds = 0.0;
+    double maximumRttSeconds = 0.0;
+    double firstRequestSentSeconds = std::numeric_limits<double>::infinity();
+    double lastResponseValidatedSeconds = 0.0;
+    bool hasApplicationInterval = false;
+    for (uint32_t clientIndex = 0; clientIndex < tcpClients.size(); ++clientIndex)
+    {
+        const Ptr<WebFlowHttpClient>& tcpClient = tcpClients[clientIndex];
+        const uint32_t successfulResponses = tcpClient->SuccessfulResponses();
+        const uint32_t failedResponses = tcpClient->FailedResponses();
+        const double averageRtt = tcpClient->AverageRttSeconds();
+        const bool connectionSucceeded = tcpClient->ConnectionWasEstablished();
+        totalRequestsSent += tcpClient->RequestsSent();
+        totalSuccessfulResponses += successfulResponses;
+        totalFailedResponses += failedResponses;
+        connectedClients += connectionSucceeded ? 1 : 0;
+        failedConnections += tcpClient->ConnectionAttemptFailed() ? 1 : 0;
+        totalDuplicateResponses += tcpClient->DuplicateResponses();
+        totalMalformedResponses += tcpClient->MalformedResponses();
+        totalRequestPayloadBytesSent += tcpClient->RequestPayloadBytesSent();
+        totalResponsePayloadBytesReceived += tcpClient->ResponsePayloadBytesReceived();
+        totalValidatedResponsePayloadBytesReceived +=
+            tcpClient->ValidatedResponsePayloadBytesReceived();
+        totalRttSeconds += averageRtt * successfulResponses;
+        maximumRttSeconds = std::max(maximumRttSeconds, tcpClient->MaximumRttSeconds());
+        if (tcpClient->HasFirstRequestSent())
+        {
+            firstRequestSentSeconds =
+                std::min(firstRequestSentSeconds, tcpClient->FirstRequestSentSeconds());
+        }
+        if (tcpClient->HasLastResponseValidated())
+        {
+            hasApplicationInterval = true;
+            lastResponseValidatedSeconds =
+                std::max(lastResponseValidatedSeconds,
+                         tcpClient->LastResponseValidatedSeconds());
+        }
+
+        std::cout << "Client #" << clientIndex + 1 << ": connection="
+                  << (connectionSucceeded ? "SUCCESS" :
+                      (tcpClient->ConnectionAttemptFailed() ? "FAILED" : "NOT ESTABLISHED"))
+                  << ", requests sent=" << tcpClient->RequestsSent()
+                  << ", responses validated=" << successfulResponses
+                  << ", failed/missing responses=" << failedResponses
+                  << ", average RTT=" << averageRtt << " s"
+                  << ", max RTT=" << tcpClient->MaximumRttSeconds() << " s"
+                  << ", duplicate responses=" << tcpClient->DuplicateResponses()
+                  << ", malformed responses=" << tcpClient->MalformedResponses() << "\n";
+    }
+    const double aggregateAverageRtt = totalSuccessfulResponses
+                                           ? totalRttSeconds / totalSuccessfulResponses
+                                           : 0.0;
+    const double applicationIntervalSeconds =
+        hasApplicationInterval && std::isfinite(firstRequestSentSeconds) &&
+                lastResponseValidatedSeconds > firstRequestSentSeconds
+            ? lastResponseValidatedSeconds - firstRequestSentSeconds
+            : 0.0;
+    const double applicationThroughputBitsPerSecond =
+        applicationIntervalSeconds > 0.0
+            ? static_cast<double>(totalValidatedResponsePayloadBytesReceived) * 8.0 /
+                  applicationIntervalSeconds
+            : 0.0;
+    const double simulationDurationSeconds = Simulator::Now().GetSeconds();
+    std::cout << "\n=== TCP HTTP-Like Summary ===\n";
+    std::cout << "Traffic profile: " << trafficLoad << "\n";
+    std::cout << "Routing mode: " << routeMode << "\n";
+    std::cout << "Configured clients: " << httpClientCount << "\n";
+    std::cout << "Requests per client: " << httpRequestCount << "\n";
+    std::cout << "Selected traffic profile: " << trafficLoad << "\n";
+    std::cout << "Expected requests/responses: " << totalRequestCount << "/"
+              << totalRequestCount << "\n";
+    std::cout << "Total requests sent: " << totalRequestsSent << " / " << totalRequestCount
+              << "\n";
+    std::cout << "Clients connected: " << connectedClients << " / " << httpClientCount << "\n";
+    std::cout << "Successful responses: " << totalSuccessfulResponses << "\n";
+    std::cout << "Failed/missing responses: " << totalFailedResponses << "\n";
+    std::cout << "Duplicate responses: " << totalDuplicateResponses << "\n";
+    std::cout << "Malformed responses: " << totalMalformedResponses << "\n";
+    std::cout << "Failed connections: " << failedConnections << "\n";
+    std::cout << "Average RTT: " << aggregateAverageRtt << " s\n";
+    std::cout << "Maximum RTT: " << maximumRttSeconds << " s\n";
+    std::cout << "Application request-body bytes sent: " << totalRequestPayloadBytesSent
+              << " bytes\n";
+    std::cout << "Application response-body bytes received: "
+              << totalResponsePayloadBytesReceived << " bytes\n";
+    std::cout << "Validated response-body bytes: "
+              << totalValidatedResponsePayloadBytesReceived << " bytes\n";
+    std::cout << "Simulation duration: " << simulationDurationSeconds << " s\n";
+    std::cout << "Measured application interval: " << applicationIntervalSeconds << " s\n";
+    std::cout << "Application response-body throughput: "
+              << applicationThroughputBitsPerSecond
+              << " bit/s (validated response-body bytes * 8 / application interval; "
+                 "not physical-link throughput)\n";
+    std::cout << "CSV log: " << std::filesystem::absolute(csvLogger->Path()).string() << "\n";
+    const bool tcpPassed = tcpServer->IsListening() && tcpServer->RequestParsed() &&
+                           tcpServer->ResponseTransmitted() &&
+                           connectedClients == httpClientCount && failedConnections == 0 &&
+                           totalRequestsSent == totalRequestCount &&
+                           totalSuccessfulResponses == totalRequestCount &&
+                           totalFailedResponses == 0 &&
+                           totalDuplicateResponses == 0 && totalMalformedResponses == 0 &&
+                           csvWriteSucceeded && routeMetricsCsvSucceeded &&
+                           simulationEventsWriteSucceeded &&
+                           std::all_of(tcpClients.begin(), tcpClients.end(), [](const auto& app) {
+                               return app->ResponseValidated();
+                           });
+    Simulator::Destroy();
+
+    if (!tcpPassed)
+    {
+        std::cerr << "[TCP validation] FAIL: listener, request parsing, response send, or "
+                     "client validation did not complete\n";
+        return 1;
+    }
+    std::cout << "[TCP validation] PASS: request parsed and response validated\n";
+
+    return 0;
+}
